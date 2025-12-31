@@ -1,4 +1,4 @@
-# 🚀 ParaCodex: AI-Powered Code Translation and Optimization Framework
+# 🚀 ParaCodex: A Profiling-Guided Autonomous Coding Agent for Reliable Parallel Code Generation and Translation
 
 A comprehensive framework for translating benchmark code between serial and parallel implementations (OpenMP, CUDA) and between different parallel programming models using AI agents, with automated performance testing and correctness verification. Supports Rodinia, NAS, HeCBench, and custom benchmarks.
 
