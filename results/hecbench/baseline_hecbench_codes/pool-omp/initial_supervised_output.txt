@@ -1,0 +1,3468 @@
+Phase: initial_supervised
+Kernel: pool
+File: main.cpp
+==================================================
+**GPU Offload Pool Grad**
+- Recast the pooling gradient routine onto the GPU with `target teams distribute parallel for`, keeping helper math in a `declare target` block and locking `THREADS_PER_TEAM=256` to match the cc89 Ada SM warp granularity (`data/src/pool-omp/main.cpp:11-185`).
+- Derived device mapping sizes from runtime dimensions and reused them in `map(present: …)` clauses so the inner kernel operates entirely on resident data from the surrounding `target data` region, eliminating redundant host↔device transfers (`data/src/pool-omp/main.cpp:69-185`).
+- Retained the serial setup/verification path while timing only the GPU work inside a single `target data` region to minimize mapping overhead and keep correctness checks identical to the reference (`data/src/pool-omp/main.cpp:187-317`).
+
+Tests:
+- `make -f Makefile.nvc clean`
+- `make -f Makefile.nvc`
+
+Next steps:
+1. Run `./main <dims…>` to confirm runtime behavior on your target workload.
+2. Capture an Nsight Compute profile to validate occupancy and memory throughput assumptions.
+
+OpenAI Codex v0.50.0 (research preview)
+--------
+workdir: /root/codex_baseline/cuda_omp_workdir
+model: gpt-5-codex
+provider: azure
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: auto
+session id: 019a3606-4e2a-79b0-b0c5-fcf710bfd494
+--------
+user
+## Translate & Optimize to OpenMP GPU Offload
+
+**Goal:** Convert the provided serial code into an OpenMP version with GPU offloading that compiles and runs efficiently.
+
+**Context:**
+- You are working on the file: `main.cpp` in `/root/codex_baseline/cuda_omp_workdir//data/src/pool-omp/`, which you will create from the serial code provided below.
+- The serial code is your starting point and must be fully converted to an OpenMP GPU-offloaded version.
+- The output code must compile successfully with `make -f Makefile.nvc` from `/root/codex_baseline/cuda_omp_workdir//data/src/pool-omp/`.
+- Before compiling, run `make -f Makefile.nvc clean` in that directory.
+
+**Your Task:**
+1. Translate the code below to an OpenMP GPU-offloaded version.
+2. Apply GPU offloading pragmas as needed.
+3. Optimize the code for performance while preserving its original functionality.
+4. Write the resulting code to `/root/codex_baseline/cuda_omp_workdir//data/src/pool-omp/main.cpp`.
+
+**Deliverable:**
+Provide the final translated code in the file `/root/codex_baseline/cuda_omp_workdir//data/src/pool-omp/main.cpp` that compiles successfully with: make -f Makefile.nvc
+**Original Serial Code:**
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <new>
+#include <string>
+
+
+
+#define BSIZE 256
+
+template <class T>
+class AvgPoolGrad {
+  public:
+    void compute(const T& x, const T& y, const T& dy, T scale, T* dx) {
+      *dx += (scale * dy);
+    }
+};
+
+template <class T>
+class MaxPoolGrad {
+  public:
+    void compute(const T& x, const T& y, const T& dy, T scale, T* dx) {
+      *dx += dy * static_cast<T>(x == y);
+    }
+};
+
+#include "reference.h"
+
+template <typename PoolProcess, typename T>
+void KernelPool2DGrad(
+    const int nthreads,
+    const T*__restrict input_data,
+    const T*__restrict output_data,
+    const T*__restrict output_grad,
+    const int channels,
+    const int input_height,
+    const int input_width,
+    const int output_height,
+    const int output_width,
+    const int ksize_height,
+    const int ksize_width,
+    const int stride_height,
+    const int stride_width,
+    const int padding_height,
+    const int padding_width,
+    PoolProcess pool_process,
+    bool exclusive,
+    T*__restrict input_grad,
+    bool channel_last = false)
+{
+    for (int index = 0; index < nthreads; index ++) {
+    int w_offset, h_offset, offsetC, batch_idx;
+    int tmp;
+    if (!channel_last) { 
+
+      w_offset = index % input_width + padding_width;
+      tmp = index / input_width;
+      h_offset = tmp % input_height + padding_height;
+      tmp = tmp / input_height;
+      offsetC = tmp % channels;
+      batch_idx = tmp / channels;
+    } else { 
+
+      offsetC = index % channels;
+      tmp = index / channels;
+      w_offset = tmp % input_width + padding_width;
+      tmp = tmp / input_width;
+      h_offset = tmp % input_height + padding_height;
+      batch_idx = tmp / input_height;
+    }
+
+    int phstart, phend;
+    int pwstart, pwend;
+    phstart = (h_offset < ksize_height) ? 0 : (h_offset - ksize_height) / stride_height + 1;
+    pwstart = (w_offset < ksize_width) ? 0 : (w_offset - ksize_width) / stride_width + 1;
+    phend = std::min(h_offset / stride_height + 1, output_height);
+    pwend = std::min(w_offset / stride_width + 1, output_width);
+
+    
+
+    T gradient = static_cast<T>(0.0);
+    T input = input_data[index];
+
+    int output_stride = batch_idx * output_height * output_width * channels;
+    if (!channel_last)
+      output_stride += offsetC * output_height * output_width;
+
+    const T *__restrict output_data_t = output_data + output_stride;
+    const T *__restrict output_grad_t = output_grad + output_stride;
+
+    for (int ph = phstart; ph < phend; ++ph) {
+      for (int pw = pwstart; pw < pwend; ++pw) {
+        int pool_size;
+        int hstart = ph * stride_height - padding_height;
+        int wstart = pw * stride_width - padding_width;
+        int hend = std::min(hstart + ksize_height, input_height);
+        int wend = std::min(wstart + ksize_width, input_width);
+        hstart = std::max(hstart, 0);
+        wstart = std::max(wstart, 0);
+        pool_size = exclusive ? (hend - hstart) * (wend - wstart)
+          : ksize_height * ksize_width;
+
+        int output_sub_idx = channel_last
+          ? (ph * output_width + pw) * channels + offsetC
+          : ph * output_width + pw;
+        pool_process.compute(input, output_data_t[output_sub_idx],
+            output_grad_t[output_sub_idx],
+            static_cast<T>(1.f / pool_size), &gradient);
+      }
+    }
+    input_grad[index] = gradient;
+  }
+}
+
+int main(int argc, char* argv[])
+{
+  if (argc != 8) {
+    printf("Usage: %s <batch> <input channels> <input height> ", argv[0]);
+    printf("<input width> <output height> <output width> <repeat>\n");
+    return 1;
+  }
+  
+
+  const int batch_size = atoi(argv[1]);
+  const int input_channels = atoi(argv[2]);
+  const int input_height = atoi(argv[3]);
+  const int input_width = atoi(argv[4]);
+
+  
+
+  const int output_height = atoi(argv[5]);
+  const int output_width = atoi(argv[6]);
+
+  
+
+  const int repeat = atoi(argv[7]);
+
+  const int input_numel = batch_size*input_channels*input_height*input_width;
+  const int output_numel = batch_size*input_channels*output_height*output_width;
+
+  
+
+  const int ksize_height = 11;
+  const int ksize_width = 11;
+  const int stride_height = 4;
+  const int stride_width = 4;
+  const int padding_height = 1;
+  const int padding_width = 1;
+  const bool exclusive = true;
+  const std::string data_format = "NCHW";
+  const bool channel_last = (data_format == "NHWC");
+
+  
+
+  int nthreads = batch_size * input_channels * input_height * input_width;
+
+  
+
+  AvgPoolGrad<float> pool_process;
+
+  float * input = new float[input_numel];
+  float * output = new float[output_numel];
+  float * output_grad = new float[output_numel];
+  float * input_grad = new float[input_numel];
+  float * input_grad_ref = new float[input_numel];
+
+  srand(123);
+  for (int i = 0; i < input_numel; ++i) {
+    input[i] = (float)rand() / (float)RAND_MAX;
+    input_grad[i] = 0.f;  
+
+  }
+
+  for (int i = 0; i < output_numel; ++i) {
+    output[i] = (float)rand() / (float)RAND_MAX;
+    output_grad[i] = input_width * input_height;
+  }
+
+    {
+    auto start = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < repeat; i++) {
+      KernelPool2DGrad<AvgPoolGrad<float>, float>(
+        nthreads, input, output, output_grad, input_channels,
+        input_height, input_width, output_height, output_width, ksize_height,
+        ksize_width, stride_height, stride_width, padding_height, padding_width,
+        pool_process, exclusive, input_grad, channel_last);
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    printf("Average kernel execution time: %f (s)\n", (time * 1e-9f) / repeat);
+  }
+
+  
+
+  reference<AvgPoolGrad<float>, float>(
+          nthreads, input, output, output_grad,
+          input_channels, input_height, input_width, output_height, output_width, ksize_height,
+          ksize_width, stride_height, stride_width, padding_height, padding_width,
+          pool_process, exclusive, input_grad_ref, channel_last);
+
+  bool ok = true;
+  for (int i = 0; i < input_numel; ++i) {
+    if (fabsf(input_grad[i] - input_grad_ref[i]) > 1e-3) {
+      ok = false;
+      break;
+    }
+  }
+  printf("%s\n", ok ? "PASS" : "FAIL");
+
+  delete[] input;
+  delete[] output;
+  delete[] input_grad;
+  delete[] input_grad_ref;
+  delete[] output_grad;
+  return 0;
+}
+
+thinking
+**Reading system_info.txt first**
+
+I'll start by following the instructions to read the system_info.txt file using the shell command. It seems like this task is complex, and since there are multiple steps involved, I should think about creating a plan afterward. But for now, the priority is to ensure that I'm in the correct working directory before executing any commands. I wonder how this system information will shape my next steps!
+exec
+bash -lc 'cat system_info.txt' in /root/codex_baseline/cuda_omp_workdir succeeded in 10ms:
+=== SYSTEM BASELINE ===
+Linux ErelPC 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+PRETTY_NAME="Ubuntu 22.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="22.04"
+VERSION="22.04.3 LTS (Jammy Jellyfish)"
+VERSION_CODENAME=jammy
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=jammy
+ldd (Ubuntu GLIBC 2.35-0ubuntu3.11) 2.35
+
+=== FIRMWARE & MICROCODE ===
+# dmidecode 3.3
+Scanning /dev/mem for entry point.
+# No SMBIOS nor DMI entry point found, sorry.
+
+thinking
+**Inspecting reference header**
+
+I'll open the `data/src/pool-omp/reference.h` file to check the functions and necessary interfaces for creating code with OpenMP target offload. This should help me ensure I implement everything correctly!
+exec
+bash -lc ls in /root/codex_baseline/cuda_omp_workdir succeeded in 11ms:
+AGENTS.md
+__pycache__
+data
+gate_sdk
+golden_labels
+output.txt
+rand_test
+rand_test.cpp
+system_info.txt
+test_omp
+test_omp.cpp
+test_omp_devices
+test_omp_devices.cpp
+test_set_device
+test_set_device.cpp
+
+thinking
+**Seeking data path reference**
+exec
+bash -lc 'ls data/src/pool-omp' in /root/codex_baseline/cuda_omp_workdir succeeded in 11ms:
+Makefile.nvc
+main
+main.cpp
+main.o
+reference.h
+
+thinking
+**Creating main.cpp from serial code**
+
+It seems like there’s an existing HPC version, but I understand I need to overwrite it with a new main.cpp as per the instructions. I’ll check the reference file and the existing main to get a good grasp of the function prototypes. Although I’m not planning just yet, I think using the planning tool might be helpful after I analyze everything. My first step will be to read through the reference files to ensure I know the target functions!
+exec
+bash -lc "sed -n '1,200p' reference.h" in /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp succeeded in 10ms:
+#include <algorithm> // max/min
+
+template <typename PoolProcess, typename T>
+void reference(
+    const int nthreads,
+    const T*__restrict input_data, 
+    const T*__restrict output_data,
+    const T*__restrict output_grad, 
+    const int channels,
+    const int input_height,
+    const int input_width,
+    const int output_height,
+    const int output_width,
+    const int ksize_height,
+    const int ksize_width,
+    const int stride_height,
+    const int stride_width,
+    const int padding_height,
+    const int padding_width,
+    PoolProcess pool_process, 
+
+thinking
+**Planning for GPU Offload**
+
+I'm realizing I need to convert the main function to support GPU offloading with OpenMP. First, I'll analyze the existing main function to see how it’s structured, which might give me clues on how to implement the conversion effectively. After that, I’ll modify main.cpp and then build and test it using make. It's clear that having a structured plan will help navigate this non-trivial task! So, I'll define at least two steps for clarity in execution.
+Plan update
+  → Inspect existing main.cpp and identify required OpenMP offload translation strategy
+  • Implement GPU-offloaded OpenMP version ensuring correctness and memory management
+  • Build with make -f Makefile.nvc clean && make -f Makefile.nvc; adjust if needed
+
+thinking
+**Inspecting main.cpp for insights**
+exec
+bash -lc "sed -n '1,200p' main.cpp" in /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp succeeded in 12ms:
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <new>
+#include <string>
+
+#include <omp.h>
+
+constexpr int THREADS_PER_TEAM = 256;
+
+#pragma omp declare target
+template <typename T>
+constexpr T device_min(const T a, const T b) noexcept {
+  return (a < b) ? a : b;
+}
+
+template <typename T>
+constexpr T device_max(const T a, const T b) noexcept {
+  return (a > b) ? a : b;
+exec
+bash -lc "sed -n '200,400p' main.cpp" in /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp succeeded in 11ms:
+
+  const int input_numel = batch_size * input_channels * input_height * input_width;
+  const int output_numel = batch_size * input_channels * output_height * output_width;
+
+  const int ksize_height = 11;
+  const int ksize_width = 11;
+  const int stride_height = 4;
+  const int stride_width = 4;
+  const int padding_height = 1;
+  const int padding_width = 1;
+  const bool exclusive = true;
+  const bool channel_last = false;  // Data format fixed to NCHW.
+
+  const int nthreads = input_numel;
+
+  AvgPoolGrad<float> pool_process;
+
+  float* input = new float[input_numel];
+  float* output = new float[output_numel];
+  float* output_grad = new float[output_numel];
+
+thinking
+**Reviewing existing main.cpp code**
+
+I'll take a closer look at the current HPC implementation in main.cpp and compare it with the provided serial code. It seems like I might need to restructure it to better follow the serial logic, particularly ensuring that the semantics match. I'll focus on HPC best practices throughout this process, aiming to refine the code for optimization while staying compliant with the instructions. Let's map out the next steps before diving into the changes!
+Plan update
+  ✓ Inspect existing main.cpp and identify required OpenMP offload translation strategy
+  → Implement GPU-offloaded OpenMP version ensuring correctness and memory management
+  • Build with make -f Makefile.nvc clean && make -f Makefile.nvc; adjust if needed
+
+thinking
+**Designing code modifications**
+
+I'm laying out a plan to improve the code by removing some redundant components and enhancing performance. I'll focus on refining the `map` operations, restructuring to use 64-bit indices for efficiency, and ensuring all necessary checks are in place to avoid division errors. The modifications will ensure that the present data is handled correctly and address the overall structure to facilitate High Performance Computing optimally.
+
+thinking
+**Correcting patch path**
+
+I realized that I need to adjust the path for the apply_patch function since it was incorrectly executed relative to the root. The file is located in the data/ directory, so I'll redo the apply_patch call with the proper path this time.
+file update
+M /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,169 +1,2 @@
+-#include <chrono>
+-#include <cmath>
+-#include <cstdio>
+-#include <cstdlib>
+-#include <new>
+-#include <string>
+-
+-#include <omp.h>
+-
+-constexpr int THREADS_PER_TEAM = 256;
+-
+-#pragma omp declare target
+-template <typename T>
+-constexpr T device_min(const T a, const T b) noexcept {
+-  return (a < b) ? a : b;
+-}
+-
+-template <typename T>
+-constexpr T device_max(const T a, const T b) noexcept {
+-  return (a > b) ? a : b;
+-}
+-
+-template <class T>
+-class AvgPoolGrad {
+- public:
+-  void compute(const T&, const T&, const T& dy, T scale, T* dx) const noexcept {
+-    *dx += scale * dy;
+-  }
+-};
+-
+-template <class T>
+-class MaxPoolGrad {
+- public:
+-  void compute(const T& x, const T& y, const T& dy, T scale, T* dx) const noexcept {
+-    (void)scale;
+-    *dx += dy * static_cast<T>(x == y);
+-  }
+-};
+-#pragma omp end declare target
+-
+-#include "reference.h"
+-
+-template <typename PoolProcess, typename T>
+-void KernelPool2DGrad(
+-    const int nthreads,
+-    const T* __restrict input_data,
+-    const T* __restrict output_data,
+-    const T* __restrict output_grad,
+-    const int channels,
+-    const int input_height,
+-    const int input_width,
+-    const int output_height,
+-    const int output_width,
+-    const int ksize_height,
+-    const int ksize_width,
+-    const int stride_height,
+-    const int stride_width,
+-    const int padding_height,
+-    const int padding_width,
+-    PoolProcess pool_process,
+-    const bool exclusive,
+-    T* __restrict input_grad,
+-    const bool channel_last = false) {
+-  if (nthreads <= 0) {
+-    return;
+-  }
+-
+-  const int input_hw = input_height * input_width;
+-  const int output_hw = output_height * output_width;
+-  const int channel_stride = input_hw;
+-  const int batch_stride = channels * channel_stride;
+-  const int batch_stride_nhwc = input_height * input_width * channels;
+-  const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
+-
+-  const int team_size = THREADS_PER_TEAM;
+-  const int computed_teams = (nthreads + team_size - 1) / team_size;
+-  const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+-
+-#pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
+-  for (int index = 0; index < nthreads; ++index) {
+-    int batch_idx = 0;
+-    int offsetC = 0;
+-    int h_idx = 0;
+-    int w_idx = 0;
+-
+-    if (!channel_last) {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride;
+-      remaining -= batch_idx * batch_stride;
+-      offsetC = remaining / channel_stride;
+-      remaining -= offsetC * channel_stride;
+-      h_idx = remaining / input_width;
+-      w_idx = remaining - h_idx * input_width;
+-    } else {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride_nhwc;
+-      remaining -= batch_idx * batch_stride_nhwc;
+-      h_idx = remaining / (input_width * channels);
+-      remaining -= h_idx * input_width * channels;
+-      w_idx = remaining / channels;
+-      offsetC = remaining - w_idx * channels;
+-    }
+-
+-    const int w_offset = w_idx + padding_width;
+-    const int h_offset = h_idx + padding_height;
+-
+-    const int phstart = (h_offset < ksize_height)
+-                            ? 0
+-                            : (h_offset - ksize_height) / stride_height + 1;
+-    const int pwstart = (w_offset < ksize_width)
+-                            ? 0
+-                            : (w_offset - ksize_width) / stride_width + 1;
+-    const int phend = device_min(h_offset / stride_height + 1, output_height);
+-    const int pwend = device_min(w_offset / stride_width + 1, output_width);
+-
+-    if (phstart >= phend || pwstart >= pwend) {
+-      input_grad[index] = static_cast<T>(0);
+-      continue;
+-    }
+-
+-    T gradient = static_cast<T>(0);
+-    const T input_value = input_data[index];
+-
+-    int output_stride = 0;
+-    if (!channel_last) {
+-      output_stride = (batch_idx * channels + offsetC) * output_hw;
+-    } else {
+-      output_stride = batch_idx * output_hw * channels;
+-    }
+-
+-    const T* __restrict output_data_t = output_data + output_stride;
+-    const T* __restrict output_grad_t = output_grad + output_stride;
+-
+-    for (int ph = phstart; ph < phend; ++ph) {
+-      const int hstart_unclamped = ph * stride_height - padding_height;
+-      const int hstart = device_max(hstart_unclamped, 0);
+-      const int hend = device_min(hstart_unclamped + ksize_height, input_height);
+-      const int effective_h = hend - hstart;
+-
+-      for (int pw = pwstart; pw < pwend; ++pw) {
+-        const int wstart_unclamped = pw * stride_width - padding_width;
+-        const int wstart = device_max(wstart_unclamped, 0);
+-        const int wend = device_min(wstart_unclamped + ksize_width, input_width);
+-        const int effective_w = wend - wstart;
+-
+-        const T scale = exclusive
+-                            ? static_cast<T>(1.f / (effective_h * effective_w))
+-                            : full_pool_inv;
+-
+-        const int output_sub_idx =
+-            channel_last ? (ph * output_width + pw) * channels + offsetC
+-                         : ph * output_width + pw;
+-
+-        pool_process.compute(input_value,
+-                             output_data_t[output_sub_idx],
+-                             output_grad_t[output_sub_idx],
+-                             scale,
+-                             &gradient);
+-      }
+-    }
+-
+-    input_grad[index] = gradient;
+-  }
+-}
++*** End Patch*** End Patch
+ 
+apply_patch(auto_approved=true) exited 0 in 5ms:
+Success. Updated the following files:
+M data/src/pool-omp/main.cpp
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..59e04dffabf48b148acfd4c86d7548969b11f24e
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,171 +1,4 @@
+-#include <chrono>
+-#include <cmath>
+-#include <cstdio>
+-#include <cstdlib>
+-#include <new>
+-#include <string>
+-
+-#include <omp.h>
+-
+-constexpr int THREADS_PER_TEAM = 256;
+-
+-#pragma omp declare target
+-template <typename T>
+-constexpr T device_min(const T a, const T b) noexcept {
+-  return (a < b) ? a : b;
+-}
+-
+-template <typename T>
+-constexpr T device_max(const T a, const T b) noexcept {
+-  return (a > b) ? a : b;
+-}
+-
+-template <class T>
+-class AvgPoolGrad {
+- public:
+-  void compute(const T&, const T&, const T& dy, T scale, T* dx) const noexcept {
+-    *dx += scale * dy;
+-  }
+-};
+-
+-template <class T>
+-class MaxPoolGrad {
+- public:
+-  void compute(const T& x, const T& y, const T& dy, T scale, T* dx) const noexcept {
+-    (void)scale;
+-    *dx += dy * static_cast<T>(x == y);
+-  }
+-};
+-#pragma omp end declare target
+-
+-#include "reference.h"
+-
+-template <typename PoolProcess, typename T>
+-void KernelPool2DGrad(
+-    const int nthreads,
+-    const T* __restrict input_data,
+-    const T* __restrict output_data,
+-    const T* __restrict output_grad,
+-    const int channels,
+-    const int input_height,
+-    const int input_width,
+-    const int output_height,
+-    const int output_width,
+-    const int ksize_height,
+-    const int ksize_width,
+-    const int stride_height,
+-    const int stride_width,
+-    const int padding_height,
+-    const int padding_width,
+-    PoolProcess pool_process,
+-    const bool exclusive,
+-    T* __restrict input_grad,
+-    const bool channel_last = false) {
+-  if (nthreads <= 0) {
+-    return;
+-  }
+-
+-  const int input_hw = input_height * input_width;
+-  const int output_hw = output_height * output_width;
+-  const int channel_stride = input_hw;
+-  const int batch_stride = channels * channel_stride;
+-  const int batch_stride_nhwc = input_height * input_width * channels;
+-  const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
+-
+-  const int team_size = THREADS_PER_TEAM;
+-  const int computed_teams = (nthreads + team_size - 1) / team_size;
+-  const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+-
+-#pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
+-  for (int index = 0; index < nthreads; ++index) {
+-    int batch_idx = 0;
+-    int offsetC = 0;
+-    int h_idx = 0;
+-    int w_idx = 0;
+-
+-    if (!channel_last) {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride;
+-      remaining -= batch_idx * batch_stride;
+-      offsetC = remaining / channel_stride;
+-      remaining -= offsetC * channel_stride;
+-      h_idx = remaining / input_width;
+-      w_idx = remaining - h_idx * input_width;
+-    } else {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride_nhwc;
+-      remaining -= batch_idx * batch_stride_nhwc;
+-      h_idx = remaining / (input_width * channels);
+-      remaining -= h_idx * input_width * channels;
+-      w_idx = remaining / channels;
+-      offsetC = remaining - w_idx * channels;
+-    }
+-
+-    const int w_offset = w_idx + padding_width;
+-    const int h_offset = h_idx + padding_height;
+-
+-    const int phstart = (h_offset < ksize_height)
+-                            ? 0
+-                            : (h_offset - ksize_height) / stride_height + 1;
+-    const int pwstart = (w_offset < ksize_width)
+-                            ? 0
+-                            : (w_offset - ksize_width) / stride_width + 1;
+-    const int phend = device_min(h_offset / stride_height + 1, output_height);
+-    const int pwend = device_min(w_offset / stride_width + 1, output_width);
+-
+-    if (phstart >= phend || pwstart >= pwend) {
+-      input_grad[index] = static_cast<T>(0);
+-      continue;
+-    }
+-
+-    T gradient = static_cast<T>(0);
+-    const T input_value = input_data[index];
+-
+-    int output_stride = 0;
+-    if (!channel_last) {
+-      output_stride = (batch_idx * channels + offsetC) * output_hw;
+-    } else {
+-      output_stride = batch_idx * output_hw * channels;
+-    }
+-
+-    const T* __restrict output_data_t = output_data + output_stride;
+-    const T* __restrict output_grad_t = output_grad + output_stride;
+-
+-    for (int ph = phstart; ph < phend; ++ph) {
+-      const int hstart_unclamped = ph * stride_height - padding_height;
+-      const int hstart = device_max(hstart_unclamped, 0);
+-      const int hend = device_min(hstart_unclamped + ksize_height, input_height);
+-      const int effective_h = hend - hstart;
+-
+-      for (int pw = pwstart; pw < pwend; ++pw) {
+-        const int wstart_unclamped = pw * stride_width - padding_width;
+-        const int wstart = device_max(wstart_unclamped, 0);
+-        const int wend = device_min(wstart_unclamped + ksize_width, input_width);
+-        const int effective_w = wend - wstart;
+-
+-        const T scale = exclusive
+-                            ? static_cast<T>(1.f / (effective_h * effective_w))
+-                            : full_pool_inv;
+-
+-        const int output_sub_idx =
+-            channel_last ? (ph * output_width + pw) * channels + offsetC
+-                         : ph * output_width + pw;
+-
+-        pool_process.compute(input_value,
+-                             output_data_t[output_sub_idx],
+-                             output_grad_t[output_sub_idx],
+-                             scale,
+-                             &gradient);
+-      }
+-    }
+-
+-    input_grad[index] = gradient;
+-  }
+-}
++*** End Patch*** End Patch
+ 
+ int main(int argc, char* argv[]) {
+   if (argc != 8) {
+
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..59e04dffabf48b148acfd4c86d7548969b11f24e
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,171 +1,4 @@
+-#include <chrono>
+-#include <cmath>
+-#include <cstdio>
+-#include <cstdlib>
+-#include <new>
+-#include <string>
+-
+-#include <omp.h>
+-
+-constexpr int THREADS_PER_TEAM = 256;
+-
+-#pragma omp declare target
+-template <typename T>
+-constexpr T device_min(const T a, const T b) noexcept {
+-  return (a < b) ? a : b;
+-}
+-
+-template <typename T>
+-constexpr T device_max(const T a, const T b) noexcept {
+-  return (a > b) ? a : b;
+-}
+-
+-template <class T>
+-class AvgPoolGrad {
+- public:
+-  void compute(const T&, const T&, const T& dy, T scale, T* dx) const noexcept {
+-    *dx += scale * dy;
+-  }
+-};
+-
+-template <class T>
+-class MaxPoolGrad {
+- public:
+-  void compute(const T& x, const T& y, const T& dy, T scale, T* dx) const noexcept {
+-    (void)scale;
+-    *dx += dy * static_cast<T>(x == y);
+-  }
+-};
+-#pragma omp end declare target
+-
+-#include "reference.h"
+-
+-template <typename PoolProcess, typename T>
+-void KernelPool2DGrad(
+-    const int nthreads,
+-    const T* __restrict input_data,
+-    const T* __restrict output_data,
+-    const T* __restrict output_grad,
+-    const int channels,
+-    const int input_height,
+-    const int input_width,
+-    const int output_height,
+-    const int output_width,
+-    const int ksize_height,
+-    const int ksize_width,
+-    const int stride_height,
+-    const int stride_width,
+-    const int padding_height,
+-    const int padding_width,
+-    PoolProcess pool_process,
+-    const bool exclusive,
+-    T* __restrict input_grad,
+-    const bool channel_last = false) {
+-  if (nthreads <= 0) {
+-    return;
+-  }
+-
+-  const int input_hw = input_height * input_width;
+-  const int output_hw = output_height * output_width;
+-  const int channel_stride = input_hw;
+-  const int batch_stride = channels * channel_stride;
+-  const int batch_stride_nhwc = input_height * input_width * channels;
+-  const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
+-
+-  const int team_size = THREADS_PER_TEAM;
+-  const int computed_teams = (nthreads + team_size - 1) / team_size;
+-  const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+-
+-#pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
+-  for (int index = 0; index < nthreads; ++index) {
+-    int batch_idx = 0;
+-    int offsetC = 0;
+-    int h_idx = 0;
+-    int w_idx = 0;
+-
+-    if (!channel_last) {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride;
+-      remaining -= batch_idx * batch_stride;
+-      offsetC = remaining / channel_stride;
+-      remaining -= offsetC * channel_stride;
+-      h_idx = remaining / input_width;
+-      w_idx = remaining - h_idx * input_width;
+-    } else {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride_nhwc;
+-      remaining -= batch_idx * batch_stride_nhwc;
+-      h_idx = remaining / (input_width * channels);
+-      remaining -= h_idx * input_width * channels;
+-      w_idx = remaining / channels;
+-      offsetC = remaining - w_idx * channels;
+-    }
+-
+-    const int w_offset = w_idx + padding_width;
+-    const int h_offset = h_idx + padding_height;
+-
+-    const int phstart = (h_offset < ksize_height)
+-                            ? 0
+-                            : (h_offset - ksize_height) / stride_height + 1;
+-    const int pwstart = (w_offset < ksize_width)
+-                            ? 0
+-                            : (w_offset - ksize_width) / stride_width + 1;
+-    const int phend = device_min(h_offset / stride_height + 1, output_height);
+-    const int pwend = device_min(w_offset / stride_width + 1, output_width);
+-
+-    if (phstart >= phend || pwstart >= pwend) {
+-      input_grad[index] = static_cast<T>(0);
+-      continue;
+-    }
+-
+-    T gradient = static_cast<T>(0);
+-    const T input_value = input_data[index];
+-
+-    int output_stride = 0;
+-    if (!channel_last) {
+-      output_stride = (batch_idx * channels + offsetC) * output_hw;
+-    } else {
+-      output_stride = batch_idx * output_hw * channels;
+-    }
+-
+-    const T* __restrict output_data_t = output_data + output_stride;
+-    const T* __restrict output_grad_t = output_grad + output_stride;
+-
+-    for (int ph = phstart; ph < phend; ++ph) {
+-      const int hstart_unclamped = ph * stride_height - padding_height;
+-      const int hstart = device_max(hstart_unclamped, 0);
+-      const int hend = device_min(hstart_unclamped + ksize_height, input_height);
+-      const int effective_h = hend - hstart;
+-
+-      for (int pw = pwstart; pw < pwend; ++pw) {
+-        const int wstart_unclamped = pw * stride_width - padding_width;
+-        const int wstart = device_max(wstart_unclamped, 0);
+-        const int wend = device_min(wstart_unclamped + ksize_width, input_width);
+-        const int effective_w = wend - wstart;
+-
+-        const T scale = exclusive
+-                            ? static_cast<T>(1.f / (effective_h * effective_w))
+-                            : full_pool_inv;
+-
+-        const int output_sub_idx =
+-            channel_last ? (ph * output_width + pw) * channels + offsetC
+-                         : ph * output_width + pw;
+-
+-        pool_process.compute(input_value,
+-                             output_data_t[output_sub_idx],
+-                             output_grad_t[output_sub_idx],
+-                             scale,
+-                             &gradient);
+-      }
+-    }
+-
+-    input_grad[index] = gradient;
+-  }
+-}
++*** End Patch*** End Patch
+ 
+ int main(int argc, char* argv[]) {
+   if (argc != 8) {
+
+
+thinking
+**Checking file after patch**
+
+I'll inspect the file to verify if the patch has indeed removed all content without any new additions. It's important to confirm whether the file is now empty or if anything has been unintentionally lost. Let's figure out the state of the file together!
+exec
+bash -lc "sed -n '1,200p' main.cpp" in /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp succeeded in 10ms:
+*** End Patch*** End Patch
+
+int main(int argc, char* argv[]) {
+  if (argc != 8) {
+    std::printf("Usage: %s <batch> <input channels> <input height> ", argv[0]);
+    std::printf("<input width> <output height> <output width> <repeat>\n");
+    return 1;
+  }
+
+  if (omp_get_num_devices() <= 0) {
+    std::fprintf(stderr, "No OpenMP target devices available.\n");
+    return 1;
+  }
+
+  const int batch_size = std::atoi(argv[1]);
+  const int input_channels = std::atoi(argv[2]);
+  const int input_height = std::atoi(argv[3]);
+  const int input_width = std::atoi(argv[4]);
+  const int output_height = std::atoi(argv[5]);
+  const int output_width = std::atoi(argv[6]);
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..59e04dffabf48b148acfd4c86d7548969b11f24e
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,171 +1,4 @@
+-#include <chrono>
+-#include <cmath>
+-#include <cstdio>
+-#include <cstdlib>
+-#include <new>
+-#include <string>
+-
+-#include <omp.h>
+-
+-constexpr int THREADS_PER_TEAM = 256;
+-
+-#pragma omp declare target
+-template <typename T>
+-constexpr T device_min(const T a, const T b) noexcept {
+-  return (a < b) ? a : b;
+-}
+-
+-template <typename T>
+-constexpr T device_max(const T a, const T b) noexcept {
+-  return (a > b) ? a : b;
+-}
+-
+-template <class T>
+-class AvgPoolGrad {
+- public:
+-  void compute(const T&, const T&, const T& dy, T scale, T* dx) const noexcept {
+-    *dx += scale * dy;
+-  }
+-};
+-
+-template <class T>
+-class MaxPoolGrad {
+- public:
+-  void compute(const T& x, const T& y, const T& dy, T scale, T* dx) const noexcept {
+-    (void)scale;
+-    *dx += dy * static_cast<T>(x == y);
+-  }
+-};
+-#pragma omp end declare target
+-
+-#include "reference.h"
+-
+-template <typename PoolProcess, typename T>
+-void KernelPool2DGrad(
+-    const int nthreads,
+-    const T* __restrict input_data,
+-    const T* __restrict output_data,
+-    const T* __restrict output_grad,
+-    const int channels,
+-    const int input_height,
+-    const int input_width,
+-    const int output_height,
+-    const int output_width,
+-    const int ksize_height,
+-    const int ksize_width,
+-    const int stride_height,
+-    const int stride_width,
+-    const int padding_height,
+-    const int padding_width,
+-    PoolProcess pool_process,
+-    const bool exclusive,
+-    T* __restrict input_grad,
+-    const bool channel_last = false) {
+-  if (nthreads <= 0) {
+-    return;
+-  }
+-
+-  const int input_hw = input_height * input_width;
+-  const int output_hw = output_height * output_width;
+-  const int channel_stride = input_hw;
+-  const int batch_stride = channels * channel_stride;
+-  const int batch_stride_nhwc = input_height * input_width * channels;
+-  const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
+-
+-  const int team_size = THREADS_PER_TEAM;
+-  const int computed_teams = (nthreads + team_size - 1) / team_size;
+-  const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+-
+-#pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
+-  for (int index = 0; index < nthreads; ++index) {
+-    int batch_idx = 0;
+-    int offsetC = 0;
+-    int h_idx = 0;
+-    int w_idx = 0;
+-
+-    if (!channel_last) {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride;
+-      remaining -= batch_idx * batch_stride;
+-      offsetC = remaining / channel_stride;
+-      remaining -= offsetC * channel_stride;
+-      h_idx = remaining / input_width;
+-      w_idx = remaining - h_idx * input_width;
+-    } else {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride_nhwc;
+-      remaining -= batch_idx * batch_stride_nhwc;
+-      h_idx = remaining / (input_width * channels);
+-      remaining -= h_idx * input_width * channels;
+-      w_idx = remaining / channels;
+-      offsetC = remaining - w_idx * channels;
+-    }
+-
+-    const int w_offset = w_idx + padding_width;
+-    const int h_offset = h_idx + padding_height;
+-
+-    const int phstart = (h_offset < ksize_height)
+-                            ? 0
+-                            : (h_offset - ksize_height) / stride_height + 1;
+-    const int pwstart = (w_offset < ksize_width)
+-                            ? 0
+-                            : (w_offset - ksize_width) / stride_width + 1;
+-    const int phend = device_min(h_offset / stride_height + 1, output_height);
+-    const int pwend = device_min(w_offset / stride_width + 1, output_width);
+-
+-    if (phstart >= phend || pwstart >= pwend) {
+-      input_grad[index] = static_cast<T>(0);
+-      continue;
+-    }
+-
+-    T gradient = static_cast<T>(0);
+-    const T input_value = input_data[index];
+-
+-    int output_stride = 0;
+-    if (!channel_last) {
+-      output_stride = (batch_idx * channels + offsetC) * output_hw;
+-    } else {
+-      output_stride = batch_idx * output_hw * channels;
+-    }
+-
+-    const T* __restrict output_data_t = output_data + output_stride;
+-    const T* __restrict output_grad_t = output_grad + output_stride;
+-
+-    for (int ph = phstart; ph < phend; ++ph) {
+-      const int hstart_unclamped = ph * stride_height - padding_height;
+-      const int hstart = device_max(hstart_unclamped, 0);
+-      const int hend = device_min(hstart_unclamped + ksize_height, input_height);
+-      const int effective_h = hend - hstart;
+-
+-      for (int pw = pwstart; pw < pwend; ++pw) {
+-        const int wstart_unclamped = pw * stride_width - padding_width;
+-        const int wstart = device_max(wstart_unclamped, 0);
+-        const int wend = device_min(wstart_unclamped + ksize_width, input_width);
+-        const int effective_w = wend - wstart;
+-
+-        const T scale = exclusive
+-                            ? static_cast<T>(1.f / (effective_h * effective_w))
+-                            : full_pool_inv;
+-
+-        const int output_sub_idx =
+-            channel_last ? (ph * output_width + pw) * channels + offsetC
+-                         : ph * output_width + pw;
+-
+-        pool_process.compute(input_value,
+-                             output_data_t[output_sub_idx],
+-                             output_grad_t[output_sub_idx],
+-                             scale,
+-                             &gradient);
+-      }
+-    }
+-
+-    input_grad[index] = gradient;
+-  }
+-}
++*** End Patch*** End Patch
+ 
+ int main(int argc, char* argv[]) {
+   if (argc != 8) {
+
+
+thinking
+**Reconstructing file content**
+
+I'll rewrite the entire file from scratch since the top got removed. Since I have the original HPC version, I plan to apply the patch using the instructions to delete the existing file and then add the new one while ensuring all code modifications are included. I need to take care of device functions and gradient calculations, making sure to avoid naming conflicts and divisions by zero along the way! Let's pull together the final desired code snippet and set it up for the patch.
+file update
+D /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp/main.cpp
+*** End Patch*** End Patch
+
+int main(int argc, char* argv[]) {
+  if (argc != 8) {
+    std::printf("Usage: %s <batch> <input channels> <input height> ", argv[0]);
+    std::printf("<input width> <output height> <output width> <repeat>\n");
+    return 1;
+  }
+
+  if (omp_get_num_devices() <= 0) {
+    std::fprintf(stderr, "No OpenMP target devices available.\n");
+    return 1;
+  }
+
+  const int batch_size = std::atoi(argv[1]);
+  const int input_channels = std::atoi(argv[2]);
+  const int input_height = std::atoi(argv[3]);
+  const int input_width = std::atoi(argv[4]);
+  const int output_height = std::atoi(argv[5]);
+  const int output_width = std::atoi(argv[6]);
+  const int repeat = std::atoi(argv[7]);
+
+  if (batch_size <= 0 || input_channels <= 0 || input_height <= 0 ||
+      input_width <= 0 || output_height <= 0 || output_width <= 0) {
+    std::fprintf(stderr, "All tensor dimensions must be positive.\n");
+    return 1;
+  }
+
+  if (repeat <= 0) {
+    std::fprintf(stderr, "Repeat count must be positive.\n");
+    return 1;
+  }
+
+  const int input_numel = batch_size * input_channels * input_height * input_width;
+  const int output_numel = batch_size * input_channels * output_height * output_width;
+
+  const int ksize_height = 11;
+  const int ksize_width = 11;
+  const int stride_height = 4;
+  const int stride_width = 4;
+  const int padding_height = 1;
+  const int padding_width = 1;
+  const bool exclusive = true;
+  const bool channel_last = false;  // Data format fixed to NCHW.
+
+  const int nthreads = input_numel;
+
+  AvgPoolGrad<float> pool_process;
+
+  float* input = new float[input_numel];
+  float* output = new float[output_numel];
+  float* output_grad = new float[output_numel];
+  float* input_grad = new float[input_numel];
+  float* input_grad_ref = new float[input_numel];
+
+  std::srand(123);
+  for (int i = 0; i < input_numel; ++i) {
+    input[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+  }
+
+  for (int i = 0; i < output_numel; ++i) {
+    output[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+    output_grad[i] = static_cast<float>(input_width * input_height);
+  }
+
+  long long compute_time_ns = 0;
+
+#pragma omp target data map(to : input[0:input_numel], \
+                                output[0:output_numel], \
+                                output_grad[0:output_numel]) \
+    map(from : input_grad[0:input_numel])
+  {
+    const auto compute_start = std::chrono::steady_clock::now();
+    for (int iter = 0; iter < repeat; ++iter) {
+      KernelPool2DGrad<AvgPoolGrad<float>, float>(
+          nthreads,
+          input,
+          output,
+          output_grad,
+          input_channels,
+          input_height,
+          input_width,
+          output_height,
+          output_width,
+          ksize_height,
+          ksize_width,
+          stride_height,
+          stride_width,
+          padding_height,
+          padding_width,
+          pool_process,
+          exclusive,
+          input_grad,
+          channel_last);
+    }
+    const auto compute_end = std::chrono::steady_clock::now();
+    compute_time_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(compute_end - compute_start)
+            .count();
+  }
+
+  std::printf("Average kernel execution time: %f (s)\n",
+              (compute_time_ns * 1e-9f) / repeat);
+
+  reference<AvgPoolGrad<float>, float>(
+      nthreads,
+      input,
+      output,
+      output_grad,
+      input_channels,
+      input_height,
+      input_width,
+      output_height,
+      output_width,
+      ksize_height,
+      ksize_width,
+      stride_height,
+      stride_width,
+      padding_height,
+      padding_width,
+      pool_process,
+      exclusive,
+      input_grad_ref,
+      channel_last);
+
+  bool ok = true;
+  for (int i = 0; i < input_numel; ++i) {
+    if (std::fabs(input_grad[i] - input_grad_ref[i]) > 1e-3f) {
+      ok = false;
+      break;
+    }
+  }
+  std::printf("%s\n", ok ? "PASS" : "FAIL");
+
+  delete[] input;
+  delete[] output;
+  delete[] input_grad;
+  delete[] input_grad_ref;
+  delete[] output_grad;
+
+  return ok ? 0 : 1;
+}
+apply_patch(auto_approved=true) exited 0 in 4ms:
+Success. Updated the following files:
+D data/src/pool-omp/main.cpp
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+deleted file mode 100644
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..0000000000000000000000000000000000000000
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ /dev/null
+@@ -1,309 +0,0 @@
+-#include <chrono>
+-#include <cmath>
+-#include <cstdio>
+-#include <cstdlib>
+-#include <new>
+-#include <string>
+-
+-#include <omp.h>
+-
+-constexpr int THREADS_PER_TEAM = 256;
+-
+-#pragma omp declare target
+-template <typename T>
+-constexpr T device_min(const T a, const T b) noexcept {
+-  return (a < b) ? a : b;
+-}
+-
+-template <typename T>
+-constexpr T device_max(const T a, const T b) noexcept {
+-  return (a > b) ? a : b;
+-}
+-
+-template <class T>
+-class AvgPoolGrad {
+- public:
+-  void compute(const T&, const T&, const T& dy, T scale, T* dx) const noexcept {
+-    *dx += scale * dy;
+-  }
+-};
+-
+-template <class T>
+-class MaxPoolGrad {
+- public:
+-  void compute(const T& x, const T& y, const T& dy, T scale, T* dx) const noexcept {
+-    (void)scale;
+-    *dx += dy * static_cast<T>(x == y);
+-  }
+-};
+-#pragma omp end declare target
+-
+-#include "reference.h"
+-
+-template <typename PoolProcess, typename T>
+-void KernelPool2DGrad(
+-    const int nthreads,
+-    const T* __restrict input_data,
+-    const T* __restrict output_data,
+-    const T* __restrict output_grad,
+-    const int channels,
+-    const int input_height,
+-    const int input_width,
+-    const int output_height,
+-    const int output_width,
+-    const int ksize_height,
+-    const int ksize_width,
+-    const int stride_height,
+-    const int stride_width,
+-    const int padding_height,
+-    const int padding_width,
+-    PoolProcess pool_process,
+-    const bool exclusive,
+-    T* __restrict input_grad,
+-    const bool channel_last = false) {
+-  if (nthreads <= 0) {
+-    return;
+-  }
+-
+-  const int input_hw = input_height * input_width;
+-  const int output_hw = output_height * output_width;
+-  const int channel_stride = input_hw;
+-  const int batch_stride = channels * channel_stride;
+-  const int batch_stride_nhwc = input_height * input_width * channels;
+-  const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
+-
+-  const int team_size = THREADS_PER_TEAM;
+-  const int computed_teams = (nthreads + team_size - 1) / team_size;
+-  const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+-
+-#pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
+-  for (int index = 0; index < nthreads; ++index) {
+-    int batch_idx = 0;
+-    int offsetC = 0;
+-    int h_idx = 0;
+-    int w_idx = 0;
+-
+-    if (!channel_last) {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride;
+-      remaining -= batch_idx * batch_stride;
+-      offsetC = remaining / channel_stride;
+-      remaining -= offsetC * channel_stride;
+-      h_idx = remaining / input_width;
+-      w_idx = remaining - h_idx * input_width;
+-    } else {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride_nhwc;
+-      remaining -= batch_idx * batch_stride_nhwc;
+-      h_idx = remaining / (input_width * channels);
+-      remaining -= h_idx * input_width * channels;
+-      w_idx = remaining / channels;
+-      offsetC = remaining - w_idx * channels;
+-    }
+-
+-    const int w_offset = w_idx + padding_width;
+-    const int h_offset = h_idx + padding_height;
+-
+-    const int phstart = (h_offset < ksize_height)
+-                            ? 0
+-                            : (h_offset - ksize_height) / stride_height + 1;
+-    const int pwstart = (w_offset < ksize_width)
+-                            ? 0
+-                            : (w_offset - ksize_width) / stride_width + 1;
+-    const int phend = device_min(h_offset / stride_height + 1, output_height);
+-    const int pwend = device_min(w_offset / stride_width + 1, output_width);
+-
+-    if (phstart >= phend || pwstart >= pwend) {
+-      input_grad[index] = static_cast<T>(0);
+-      continue;
+-    }
+-
+-    T gradient = static_cast<T>(0);
+-    const T input_value = input_data[index];
+-
+-    int output_stride = 0;
+-    if (!channel_last) {
+-      output_stride = (batch_idx * channels + offsetC) * output_hw;
+-    } else {
+-      output_stride = batch_idx * output_hw * channels;
+-    }
+-
+-    const T* __restrict output_data_t = output_data + output_stride;
+-    const T* __restrict output_grad_t = output_grad + output_stride;
+-
+-    for (int ph = phstart; ph < phend; ++ph) {
+-      const int hstart_unclamped = ph * stride_height - padding_height;
+-      const int hstart = device_max(hstart_unclamped, 0);
+-      const int hend = device_min(hstart_unclamped + ksize_height, input_height);
+-      const int effective_h = hend - hstart;
+-
+-      for (int pw = pwstart; pw < pwend; ++pw) {
+-        const int wstart_unclamped = pw * stride_width - padding_width;
+-        const int wstart = device_max(wstart_unclamped, 0);
+-        const int wend = device_min(wstart_unclamped + ksize_width, input_width);
+-        const int effective_w = wend - wstart;
+-
+-        const T scale = exclusive
+-                            ? static_cast<T>(1.f / (effective_h * effective_w))
+-                            : full_pool_inv;
+-
+-        const int output_sub_idx =
+-            channel_last ? (ph * output_width + pw) * channels + offsetC
+-                         : ph * output_width + pw;
+-
+-        pool_process.compute(input_value,
+-                             output_data_t[output_sub_idx],
+-                             output_grad_t[output_sub_idx],
+-                             scale,
+-                             &gradient);
+-      }
+-    }
+-
+-    input_grad[index] = gradient;
+-  }
+-}
+-
+-int main(int argc, char* argv[]) {
+-  if (argc != 8) {
+-    std::printf("Usage: %s <batch> <input channels> <input height> ", argv[0]);
+-    std::printf("<input width> <output height> <output width> <repeat>\n");
+-    return 1;
+-  }
+-
+-  if (omp_get_num_devices() <= 0) {
+-    std::fprintf(stderr, "No OpenMP target devices available.\n");
+-    return 1;
+-  }
+-
+-  const int batch_size = std::atoi(argv[1]);
+-  const int input_channels = std::atoi(argv[2]);
+-  const int input_height = std::atoi(argv[3]);
+-  const int input_width = std::atoi(argv[4]);
+-  const int output_height = std::atoi(argv[5]);
+-  const int output_width = std::atoi(argv[6]);
+-  const int repeat = std::atoi(argv[7]);
+-
+-  if (batch_size <= 0 || input_channels <= 0 || input_height <= 0 ||
+-      input_width <= 0 || output_height <= 0 || output_width <= 0) {
+-    std::fprintf(stderr, "All tensor dimensions must be positive.\n");
+-    return 1;
+-  }
+-
+-  if (repeat <= 0) {
+-    std::fprintf(stderr, "Repeat count must be positive.\n");
+-    return 1;
+-  }
+-
+-  const int input_numel = batch_size * input_channels * input_height * input_width;
+-  const int output_numel = batch_size * input_channels * output_height * output_width;
+-
+-  const int ksize_height = 11;
+-  const int ksize_width = 11;
+-  const int stride_height = 4;
+-  const int stride_width = 4;
+-  const int padding_height = 1;
+-  const int padding_width = 1;
+-  const bool exclusive = true;
+-  const bool channel_last = false;  // Data format fixed to NCHW.
+-
+-  const int nthreads = input_numel;
+-
+-  AvgPoolGrad<float> pool_process;
+-
+-  float* input = new float[input_numel];
+-  float* output = new float[output_numel];
+-  float* output_grad = new float[output_numel];
+-  float* input_grad = new float[input_numel];
+-  float* input_grad_ref = new float[input_numel];
+-
+-  std::srand(123);
+-  for (int i = 0; i < input_numel; ++i) {
+-    input[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+-  }
+-
+-  for (int i = 0; i < output_numel; ++i) {
+-    output[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+-    output_grad[i] = static_cast<float>(input_width * input_height);
+-  }
+-
+-  long long compute_time_ns = 0;
+-
+-#pragma omp target data map(to : input[0:input_numel], \
+-                                output[0:output_numel], \
+-                                output_grad[0:output_numel]) \
+-    map(from : input_grad[0:input_numel])
+-  {
+-    const auto compute_start = std::chrono::steady_clock::now();
+-    for (int iter = 0; iter < repeat; ++iter) {
+-      KernelPool2DGrad<AvgPoolGrad<float>, float>(
+-          nthreads,
+-          input,
+-          output,
+-          output_grad,
+-          input_channels,
+-          input_height,
+-          input_width,
+-          output_height,
+-          output_width,
+-          ksize_height,
+-          ksize_width,
+-          stride_height,
+-          stride_width,
+-          padding_height,
+-          padding_width,
+-          pool_process,
+-          exclusive,
+-          input_grad,
+-          channel_last);
+-    }
+-    const auto compute_end = std::chrono::steady_clock::now();
+-    compute_time_ns =
+-        std::chrono::duration_cast<std::chrono::nanoseconds>(compute_end - compute_start)
+-            .count();
+-  }
+-
+-  std::printf("Average kernel execution time: %f (s)\n",
+-              (compute_time_ns * 1e-9f) / repeat);
+-
+-  reference<AvgPoolGrad<float>, float>(
+-      nthreads,
+-      input,
+-      output,
+-      output_grad,
+-      input_channels,
+-      input_height,
+-      input_width,
+-      output_height,
+-      output_width,
+-      ksize_height,
+-      ksize_width,
+-      stride_height,
+-      stride_width,
+-      padding_height,
+-      padding_width,
+-      pool_process,
+-      exclusive,
+-      input_grad_ref,
+-      channel_last);
+-
+-  bool ok = true;
+-  for (int i = 0; i < input_numel; ++i) {
+-    if (std::fabs(input_grad[i] - input_grad_ref[i]) > 1e-3f) {
+-      ok = false;
+-      break;
+-    }
+-  }
+-  std::printf("%s\n", ok ? "PASS" : "FAIL");
+-
+-  delete[] input;
+-  delete[] output;
+-  delete[] input_grad;
+-  delete[] input_grad_ref;
+-  delete[] output_grad;
+-
+-  return ok ? 0 : 1;
+-}
+
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+deleted file mode 100644
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..0000000000000000000000000000000000000000
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ /dev/null
+@@ -1,309 +0,0 @@
+-#include <chrono>
+-#include <cmath>
+-#include <cstdio>
+-#include <cstdlib>
+-#include <new>
+-#include <string>
+-
+-#include <omp.h>
+-
+-constexpr int THREADS_PER_TEAM = 256;
+-
+-#pragma omp declare target
+-template <typename T>
+-constexpr T device_min(const T a, const T b) noexcept {
+-  return (a < b) ? a : b;
+-}
+-
+-template <typename T>
+-constexpr T device_max(const T a, const T b) noexcept {
+-  return (a > b) ? a : b;
+-}
+-
+-template <class T>
+-class AvgPoolGrad {
+- public:
+-  void compute(const T&, const T&, const T& dy, T scale, T* dx) const noexcept {
+-    *dx += scale * dy;
+-  }
+-};
+-
+-template <class T>
+-class MaxPoolGrad {
+- public:
+-  void compute(const T& x, const T& y, const T& dy, T scale, T* dx) const noexcept {
+-    (void)scale;
+-    *dx += dy * static_cast<T>(x == y);
+-  }
+-};
+-#pragma omp end declare target
+-
+-#include "reference.h"
+-
+-template <typename PoolProcess, typename T>
+-void KernelPool2DGrad(
+-    const int nthreads,
+-    const T* __restrict input_data,
+-    const T* __restrict output_data,
+-    const T* __restrict output_grad,
+-    const int channels,
+-    const int input_height,
+-    const int input_width,
+-    const int output_height,
+-    const int output_width,
+-    const int ksize_height,
+-    const int ksize_width,
+-    const int stride_height,
+-    const int stride_width,
+-    const int padding_height,
+-    const int padding_width,
+-    PoolProcess pool_process,
+-    const bool exclusive,
+-    T* __restrict input_grad,
+-    const bool channel_last = false) {
+-  if (nthreads <= 0) {
+-    return;
+-  }
+-
+-  const int input_hw = input_height * input_width;
+-  const int output_hw = output_height * output_width;
+-  const int channel_stride = input_hw;
+-  const int batch_stride = channels * channel_stride;
+-  const int batch_stride_nhwc = input_height * input_width * channels;
+-  const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
+-
+-  const int team_size = THREADS_PER_TEAM;
+-  const int computed_teams = (nthreads + team_size - 1) / team_size;
+-  const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+-
+-#pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
+-  for (int index = 0; index < nthreads; ++index) {
+-    int batch_idx = 0;
+-    int offsetC = 0;
+-    int h_idx = 0;
+-    int w_idx = 0;
+-
+-    if (!channel_last) {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride;
+-      remaining -= batch_idx * batch_stride;
+-      offsetC = remaining / channel_stride;
+-      remaining -= offsetC * channel_stride;
+-      h_idx = remaining / input_width;
+-      w_idx = remaining - h_idx * input_width;
+-    } else {
+-      int remaining = index;
+-      batch_idx = remaining / batch_stride_nhwc;
+-      remaining -= batch_idx * batch_stride_nhwc;
+-      h_idx = remaining / (input_width * channels);
+-      remaining -= h_idx * input_width * channels;
+-      w_idx = remaining / channels;
+-      offsetC = remaining - w_idx * channels;
+-    }
+-
+-    const int w_offset = w_idx + padding_width;
+-    const int h_offset = h_idx + padding_height;
+-
+-    const int phstart = (h_offset < ksize_height)
+-                            ? 0
+-                            : (h_offset - ksize_height) / stride_height + 1;
+-    const int pwstart = (w_offset < ksize_width)
+-                            ? 0
+-                            : (w_offset - ksize_width) / stride_width + 1;
+-    const int phend = device_min(h_offset / stride_height + 1, output_height);
+-    const int pwend = device_min(w_offset / stride_width + 1, output_width);
+-
+-    if (phstart >= phend || pwstart >= pwend) {
+-      input_grad[index] = static_cast<T>(0);
+-      continue;
+-    }
+-
+-    T gradient = static_cast<T>(0);
+-    const T input_value = input_data[index];
+-
+-    int output_stride = 0;
+-    if (!channel_last) {
+-      output_stride = (batch_idx * channels + offsetC) * output_hw;
+-    } else {
+-      output_stride = batch_idx * output_hw * channels;
+-    }
+-
+-    const T* __restrict output_data_t = output_data + output_stride;
+-    const T* __restrict output_grad_t = output_grad + output_stride;
+-
+-    for (int ph = phstart; ph < phend; ++ph) {
+-      const int hstart_unclamped = ph * stride_height - padding_height;
+-      const int hstart = device_max(hstart_unclamped, 0);
+-      const int hend = device_min(hstart_unclamped + ksize_height, input_height);
+-      const int effective_h = hend - hstart;
+-
+-      for (int pw = pwstart; pw < pwend; ++pw) {
+-        const int wstart_unclamped = pw * stride_width - padding_width;
+-        const int wstart = device_max(wstart_unclamped, 0);
+-        const int wend = device_min(wstart_unclamped + ksize_width, input_width);
+-        const int effective_w = wend - wstart;
+-
+-        const T scale = exclusive
+-                            ? static_cast<T>(1.f / (effective_h * effective_w))
+-                            : full_pool_inv;
+-
+-        const int output_sub_idx =
+-            channel_last ? (ph * output_width + pw) * channels + offsetC
+-                         : ph * output_width + pw;
+-
+-        pool_process.compute(input_value,
+-                             output_data_t[output_sub_idx],
+-                             output_grad_t[output_sub_idx],
+-                             scale,
+-                             &gradient);
+-      }
+-    }
+-
+-    input_grad[index] = gradient;
+-  }
+-}
+-
+-int main(int argc, char* argv[]) {
+-  if (argc != 8) {
+-    std::printf("Usage: %s <batch> <input channels> <input height> ", argv[0]);
+-    std::printf("<input width> <output height> <output width> <repeat>\n");
+-    return 1;
+-  }
+-
+-  if (omp_get_num_devices() <= 0) {
+-    std::fprintf(stderr, "No OpenMP target devices available.\n");
+-    return 1;
+-  }
+-
+-  const int batch_size = std::atoi(argv[1]);
+-  const int input_channels = std::atoi(argv[2]);
+-  const int input_height = std::atoi(argv[3]);
+-  const int input_width = std::atoi(argv[4]);
+-  const int output_height = std::atoi(argv[5]);
+-  const int output_width = std::atoi(argv[6]);
+-  const int repeat = std::atoi(argv[7]);
+-
+-  if (batch_size <= 0 || input_channels <= 0 || input_height <= 0 ||
+-      input_width <= 0 || output_height <= 0 || output_width <= 0) {
+-    std::fprintf(stderr, "All tensor dimensions must be positive.\n");
+-    return 1;
+-  }
+-
+-  if (repeat <= 0) {
+-    std::fprintf(stderr, "Repeat count must be positive.\n");
+-    return 1;
+-  }
+-
+-  const int input_numel = batch_size * input_channels * input_height * input_width;
+-  const int output_numel = batch_size * input_channels * output_height * output_width;
+-
+-  const int ksize_height = 11;
+-  const int ksize_width = 11;
+-  const int stride_height = 4;
+-  const int stride_width = 4;
+-  const int padding_height = 1;
+-  const int padding_width = 1;
+-  const bool exclusive = true;
+-  const bool channel_last = false;  // Data format fixed to NCHW.
+-
+-  const int nthreads = input_numel;
+-
+-  AvgPoolGrad<float> pool_process;
+-
+-  float* input = new float[input_numel];
+-  float* output = new float[output_numel];
+-  float* output_grad = new float[output_numel];
+-  float* input_grad = new float[input_numel];
+-  float* input_grad_ref = new float[input_numel];
+-
+-  std::srand(123);
+-  for (int i = 0; i < input_numel; ++i) {
+-    input[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+-  }
+-
+-  for (int i = 0; i < output_numel; ++i) {
+-    output[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+-    output_grad[i] = static_cast<float>(input_width * input_height);
+-  }
+-
+-  long long compute_time_ns = 0;
+-
+-#pragma omp target data map(to : input[0:input_numel], \
+-                                output[0:output_numel], \
+-                                output_grad[0:output_numel]) \
+-    map(from : input_grad[0:input_numel])
+-  {
+-    const auto compute_start = std::chrono::steady_clock::now();
+-    for (int iter = 0; iter < repeat; ++iter) {
+-      KernelPool2DGrad<AvgPoolGrad<float>, float>(
+-          nthreads,
+-          input,
+-          output,
+-          output_grad,
+-          input_channels,
+-          input_height,
+-          input_width,
+-          output_height,
+-          output_width,
+-          ksize_height,
+-          ksize_width,
+-          stride_height,
+-          stride_width,
+-          padding_height,
+-          padding_width,
+-          pool_process,
+-          exclusive,
+-          input_grad,
+-          channel_last);
+-    }
+-    const auto compute_end = std::chrono::steady_clock::now();
+-    compute_time_ns =
+-        std::chrono::duration_cast<std::chrono::nanoseconds>(compute_end - compute_start)
+-            .count();
+-  }
+-
+-  std::printf("Average kernel execution time: %f (s)\n",
+-              (compute_time_ns * 1e-9f) / repeat);
+-
+-  reference<AvgPoolGrad<float>, float>(
+-      nthreads,
+-      input,
+-      output,
+-      output_grad,
+-      input_channels,
+-      input_height,
+-      input_width,
+-      output_height,
+-      output_width,
+-      ksize_height,
+-      ksize_width,
+-      stride_height,
+-      stride_width,
+-      padding_height,
+-      padding_width,
+-      pool_process,
+-      exclusive,
+-      input_grad_ref,
+-      channel_last);
+-
+-  bool ok = true;
+-  for (int i = 0; i < input_numel; ++i) {
+-    if (std::fabs(input_grad[i] - input_grad_ref[i]) > 1e-3f) {
+-      ok = false;
+-      break;
+-    }
+-  }
+-  std::printf("%s\n", ok ? "PASS" : "FAIL");
+-
+-  delete[] input;
+-  delete[] output;
+-  delete[] input_grad;
+-  delete[] input_grad_ref;
+-  delete[] output_grad;
+-
+-  return ok ? 0 : 1;
+-}
+
+
+thinking
+**Adding new file**
+file update
+A /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp/main.cpp
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <new>
+#include <string>
+
+#include <omp.h>
+
+constexpr int THREADS_PER_TEAM = 256;
+
+#pragma omp declare target
+template <typename T>
+constexpr T device_min(const T a, const T b) noexcept {
+  return (a < b) ? a : b;
+}
+
+template <typename T>
+constexpr T device_max(const T a, const T b) noexcept {
+  return (a > b) ? a : b;
+}
+
+template <class T>
+class AvgPoolGrad {
+ public:
+  void compute(const T&, const T&, const T& dy, T scale, T* dx) const noexcept {
+    *dx += scale * dy;
+  }
+};
+
+template <class T>
+class MaxPoolGrad {
+ public:
+  void compute(const T& x, const T& y, const T& dy, T scale, T* dx) const noexcept {
+    (void)scale;
+    *dx += dy * static_cast<T>(x == y);
+  }
+};
+#pragma omp end declare target
+
+#include "reference.h"
+
+template <typename PoolProcess, typename T>
+void KernelPool2DGrad(
+    const int nthreads,
+    const T* __restrict input_data,
+    const T* __restrict output_data,
+    const T* __restrict output_grad,
+    const int channels,
+    const int input_height,
+    const int input_width,
+    const int output_height,
+    const int output_width,
+    const int ksize_height,
+    const int ksize_width,
+    const int stride_height,
+    const int stride_width,
+    const int padding_height,
+    const int padding_width,
+    PoolProcess pool_process,
+    const bool exclusive,
+    T* __restrict input_grad,
+    const bool channel_last = false) {
+  if (nthreads <= 0) {
+    return;
+  }
+
+  const std::int64_t spatial_hw =
+      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
+  const std::int64_t denom =
+      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
+  const int batch_size =
+      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
+
+  const int input_hw = input_height * input_width;
+  const int output_hw = output_height * output_width;
+  const int channel_stride = input_hw;
+  const int batch_stride = channels * channel_stride;
+  const int batch_stride_nhwc = input_height * input_width * channels;
+  const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
+  const std::size_t input_count = static_cast<std::size_t>(nthreads);
+  const std::size_t output_count =
+      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
+      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
+
+  const int team_size = THREADS_PER_TEAM;
+  const int computed_teams = (nthreads + team_size - 1) / team_size;
+  const int num_teams = computed_teams > 0 ? computed_teams : 1;
+
+#pragma omp target teams distribute parallel for \
+    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
+    map(present: input_data[0:input_count], \
+                 output_data[0:output_count], \
+                 output_grad[0:output_count], \
+                 input_grad[0:input_count]) \
+    firstprivate(pool_process)
+  for (int index = 0; index < nthreads; ++index) {
+    int batch_idx = 0;
+    int offsetC = 0;
+    int h_idx = 0;
+    int w_idx = 0;
+
+    if (!channel_last) {
+      int remaining = index;
+      batch_idx = remaining / batch_stride;
+      remaining -= batch_idx * batch_stride;
+      offsetC = remaining / channel_stride;
+      remaining -= offsetC * channel_stride;
+      h_idx = remaining / input_width;
+      w_idx = remaining - h_idx * input_width;
+    } else {
+      int remaining = index;
+      batch_idx = remaining / batch_stride_nhwc;
+      remaining -= batch_idx * batch_stride_nhwc;
+      h_idx = remaining / (input_width * channels);
+      remaining -= h_idx * input_width * channels;
+      w_idx = remaining / channels;
+      offsetC = remaining - w_idx * channels;
+    }
+
+    const int w_offset = w_idx + padding_width;
+    const int h_offset = h_idx + padding_height;
+
+    const int phstart = (h_offset < ksize_height)
+                            ? 0
+                            : (h_offset - ksize_height) / stride_height + 1;
+    const int pwstart = (w_offset < ksize_width)
+                            ? 0
+                            : (w_offset - ksize_width) / stride_width + 1;
+    const int phend = device_min(h_offset / stride_height + 1, output_height);
+    const int pwend = device_min(w_offset / stride_width + 1, output_width);
+
+    if (phstart >= phend || pwstart >= pwend) {
+      input_grad[index] = static_cast<T>(0);
+      continue;
+    }
+
+    T gradient = static_cast<T>(0);
+    const T input_value = input_data[index];
+
+    int output_stride = 0;
+    if (!channel_last) {
+      output_stride = (batch_idx * channels + offsetC) * output_hw;
+    } else {
+      output_stride = batch_idx * output_hw * channels;
+    }
+
+    const T* __restrict output_data_t = output_data + output_stride;
+    const T* __restrict output_grad_t = output_grad + output_stride;
+
+    for (int ph = phstart; ph < phend; ++ph) {
+      const int hstart_unclamped = ph * stride_height - padding_height;
+      const int hstart = device_max(hstart_unclamped, 0);
+      const int hend = device_min(hstart_unclamped + ksize_height, input_height);
+      const int effective_h = hend - hstart;
+
+      for (int pw = pwstart; pw < pwend; ++pw) {
+        const int wstart_unclamped = pw * stride_width - padding_width;
+        const int wstart = device_max(wstart_unclamped, 0);
+        const int wend = device_min(wstart_unclamped + ksize_width, input_width);
+        const int effective_w = wend - wstart;
+
+        const T scale = exclusive
+                            ? static_cast<T>(1.f / (effective_h * effective_w))
+                            : full_pool_inv;
+
+        const int output_sub_idx =
+            channel_last ? (ph * output_width + pw) * channels + offsetC
+                         : ph * output_width + pw;
+
+        pool_process.compute(input_value,
+                             output_data_t[output_sub_idx],
+                             output_grad_t[output_sub_idx],
+                             scale,
+                             &gradient);
+      }
+    }
+
+    input_grad[index] = gradient;
+  }
+}
+
+int main(int argc, char* argv[]) {
+  if (argc != 8) {
+    std::printf("Usage: %s <batch> <input channels> <input height> ", argv[0]);
+    std::printf("<input width> <output height> <output width> <repeat>\n");
+    return 1;
+  }
+
+  if (omp_get_num_devices() <= 0) {
+    std::fprintf(stderr, "No OpenMP target devices available.\n");
+    return 1;
+  }
+
+  const int batch_size = std::atoi(argv[1]);
+  const int input_channels = std::atoi(argv[2]);
+  const int input_height = std::atoi(argv[3]);
+  const int input_width = std::atoi(argv[4]);
+  const int output_height = std::atoi(argv[5]);
+  const int output_width = std::atoi(argv[6]);
+  const int repeat = std::atoi(argv[7]);
+
+  if (batch_size <= 0 || input_channels <= 0 || input_height <= 0 ||
+      input_width <= 0 || output_height <= 0 || output_width <= 0) {
+    std::fprintf(stderr, "All tensor dimensions must be positive.\n");
+    return 1;
+  }
+
+  if (repeat <= 0) {
+    std::fprintf(stderr, "Repeat count must be positive.\n");
+    return 1;
+  }
+
+  const int input_numel = batch_size * input_channels * input_height * input_width;
+  const int output_numel = batch_size * input_channels * output_height * output_width;
+
+  const int ksize_height = 11;
+  const int ksize_width = 11;
+  const int stride_height = 4;
+  const int stride_width = 4;
+  const int padding_height = 1;
+  const int padding_width = 1;
+  const bool exclusive = true;
+  const bool channel_last = false;  // Data format fixed to NCHW.
+
+  const int nthreads = input_numel;
+
+  AvgPoolGrad<float> pool_process;
+
+  float* input = new float[input_numel];
+  float* output = new float[output_numel];
+  float* output_grad = new float[output_numel];
+  float* input_grad = new float[input_numel];
+  float* input_grad_ref = new float[input_numel];
+
+  std::srand(123);
+  for (int i = 0; i < input_numel; ++i) {
+    input[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+  }
+
+  for (int i = 0; i < output_numel; ++i) {
+    output[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+    output_grad[i] = static_cast<float>(input_width * input_height);
+  }
+
+  long long compute_time_ns = 0;
+
+#pragma omp target data map(to : input[0:input_numel], \
+                                output[0:output_numel], \
+                                output_grad[0:output_numel]) \
+    map(from : input_grad[0:input_numel])
+  {
+    const auto compute_start = std::chrono::steady_clock::now();
+    for (int iter = 0; iter < repeat; ++iter) {
+      KernelPool2DGrad<AvgPoolGrad<float>, float>(
+          nthreads,
+          input,
+          output,
+          output_grad,
+          input_channels,
+          input_height,
+          input_width,
+          output_height,
+          output_width,
+          ksize_height,
+          ksize_width,
+          stride_height,
+          stride_width,
+          padding_height,
+          padding_width,
+          pool_process,
+          exclusive,
+          input_grad,
+          channel_last);
+    }
+    const auto compute_end = std::chrono::steady_clock::now();
+    compute_time_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(compute_end - compute_start)
+            .count();
+  }
+
+  std::printf("Average kernel execution time: %f (s)\n",
+              (compute_time_ns * 1e-9f) / repeat);
+
+  reference<AvgPoolGrad<float>, float>(
+      nthreads,
+      input,
+      output,
+      output_grad,
+      input_channels,
+      input_height,
+      input_width,
+      output_height,
+      output_width,
+      ksize_height,
+      ksize_width,
+      stride_height,
+      stride_width,
+      padding_height,
+      padding_width,
+      pool_process,
+      exclusive,
+      input_grad_ref,
+      channel_last);
+
+  bool ok = true;
+  for (int i = 0; i < input_numel; ++i) {
+    if (std::fabs(input_grad[i] - input_grad_ref[i]) > 1e-3f) {
+      ok = false;
+      break;
+    }
+  }
+  std::printf("%s\n", ok ? "PASS" : "FAIL");
+
+  delete[] input;
+  delete[] output;
+  delete[] input_grad;
+  delete[] input_grad_ref;
+  delete[] output_grad;
+
+  return ok ? 0 : 1;
+}
+apply_patch(auto_approved=true) exited 0 in 6ms:
+Success. Updated the following files:
+A data/src/pool-omp/main.cpp
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..71a159c54baf4fc4787ff9dc3d6521bda348a431
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,5 +1,6 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+@@ -65,22 +66,35 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+   const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..71a159c54baf4fc4787ff9dc3d6521bda348a431
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,5 +1,6 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+@@ -65,22 +66,35 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+   const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Ensuring header inclusions**
+exec
+bash -lc "sed -n '1,200p' main.cpp" in /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp succeeded in 12ms:
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <new>
+#include <string>
+
+#include <omp.h>
+
+constexpr int THREADS_PER_TEAM = 256;
+
+#pragma omp declare target
+template <typename T>
+constexpr T device_min(const T a, const T b) noexcept {
+  return (a < b) ? a : b;
+}
+
+template <typename T>
+constexpr T device_max(const T a, const T b) noexcept {
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..71a159c54baf4fc4787ff9dc3d6521bda348a431
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,5 +1,6 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+@@ -65,22 +66,35 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+   const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Modifying Includes and Validations**
+
+I'm reviewing my includes to streamline the code, cutting out `#include <string>` since it's not used. Then, I’m ensuring that the variable `denom` is safely calculated while maintaining loop integrity to prevent zero-divisions. Validating the mappings for `output_data` is next. I’ll achieve high-performance computing (HPC) by avoiding unnecessary 64-bit operations and ensuring everything is initialized properly. Lastly, I’ll use `apply_patch` to remove the unused include. Let's get this code organized!
+file update
+M /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -6,3 +6,2 @@
+ #include <new>
+-#include <string>
+ 
+apply_patch(auto_approved=true) exited 0 in 5ms:
+Success. Updated the following files:
+M data/src/pool-omp/main.cpp
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..27419f63183d9126ac2ab4e1cd6a2601514c81c3
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,9 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,22 +65,35 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+   const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..27419f63183d9126ac2ab4e1cd6a2601514c81c3
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,9 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,22 +65,35 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+   const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Refining code includes and checks**
+
+I'm ensuring the right headers are included, like `<cmath>` for `std::fabs` and potentially needing `<cstddef>` for `std::size_t`. I’m also refining the `Kernel` to prevent checks for zero denominators, which seems improbable, but might reorganize to reduce duplication. I want to ensure `batch_size` is computed positively and that there’s no use of `std::fabs` directly inside `main`. Additionally, I’ll check for potential compile errors and verify mappings to align batch sizes and dimensions properly. Let’s not forget to add the necessary include statements along the way!
+file update
+M /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -2,2 +2,3 @@
+ #include <cmath>
++#include <cstddef>
+ #include <cstdint>
+apply_patch(auto_approved=true) exited 0 in 6ms:
+Success. Updated the following files:
+M data/src/pool-omp/main.cpp
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..295b19b063151c1cd29b46ae1654fc5544a0ed3b
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,22 +66,35 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+   const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..295b19b063151c1cd29b46ae1654fc5544a0ed3b
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,22 +66,35 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+   const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Ensuring profiling inclusion**
+
+I'll make sure we include the necessary profiling references in our plan. While we can't use ncu for the profiling step, we can still document our methods to remain methodical and rigorous. I'll also update step 2 of the plan to indicate that it's completed.
+Plan update
+  ✓ Inspect existing main.cpp and identify required OpenMP offload translation strategy
+  ✓ Implement GPU-offloaded OpenMP version ensuring correctness and memory management
+  → Build with make -f Makefile.nvc clean && make -f Makefile.nvc; adjust if needed
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..295b19b063151c1cd29b46ae1654fc5544a0ed3b
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,22 +66,35 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+   const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Building the project**
+
+I’ll start by cleaning the project using `make -f Makefile.nvc clean`, then I’ll follow up with `make -f Makefile.nvc` to build it. This will ensure that we're working with a clean slate before the actual build process begins.
+exec
+bash -lc 'make -f Makefile.nvc clean' in /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp succeeded in 11ms:
+rm -rf main main.o
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..295b19b063151c1cd29b46ae1654fc5544a0ed3b
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,22 +66,35 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+   const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Compiling code**
+exec
+bash -lc 'make -f Makefile.nvc' in /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp succeeded in 801ms:
+nvc++  -std=c++14 -Wall -I/root/codex_baseline/cuda_omp_workdir/gate_sdk -O3 -Minfo -mp=gpu -gpu=cc89 -c main.cpp -o main.o
+"main.cpp", line 82: warning: variable "input_count" was declared but never referenced [declared_but_not_referenced]
+    const std::size_t input_count = static_cast<std::size_t>(nthreads);
+                      ^
+
+Remark: individual warnings can be suppressed with "--diag_suppress <warning-name>"
+
+"main.cpp", line 83: warning: variable "output_count" was declared but never referenced [declared_but_not_referenced]
+    const std::size_t output_count =
+                      ^
+
+"main.cpp", line 89: warning: variable "num_teams" was declared but never referenced [declared_but_not_referenced]
+    const int num_teams = computed_teams > 0 ? computed_teams : 1;
+              ^
+
+main:
+    238, Loop not vectorized/parallelized: contains call
+    242, Loop not vectorized/parallelized: contains call
+    253, Generating map(from:input_grad[:input_numel]) 
+         Generating map(to:output_grad[:output_numel],output[:output_numel],input[:input_numel]) 
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..295b19b063151c1cd29b46ae1654fc5544a0ed3b
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,22 +66,35 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+   const int num_teams = computed_teams > 0 ? computed_teams : 1;
+-  (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Resolving compiler warnings**
+
+I’m working through the warnings regarding unused variables in the code, especially focusing on `input_count`, `output_count`, and `num_teams`. It seems the compiler isn't recognizing their use in the map clauses, even though I've used them. One solution is to mark them with `(void)` to indicate they're intentionally unused, ensuring they're seen as referenced by the compiler. I plan to restructure the code to directly compute necessary values inline, which might help clear up those warnings without losing functionality. I’ll implement these adjustments and check for any other potential issues along the way!
+file update
+M /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -85,2 +85,4 @@
+       static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
++  (void)input_count;
++  (void)output_count;
+ 
+@@ -89,2 +91,3 @@
+   const int num_teams = computed_teams > 0 ? computed_teams : 1;
++  (void)num_teams;
+ 
+apply_patch(auto_approved=true) exited 0 in 4ms:
+Success. Updated the following files:
+M data/src/pool-omp/main.cpp
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..c670d9c560e04e5072dfa4c0bb8bcc82fa69b3a6
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,12 +66,25 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
++  (void)input_count;
++  (void)output_count;
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+@@ -78,9 +92,12 @@
+   (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..c670d9c560e04e5072dfa4c0bb8bcc82fa69b3a6
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,12 +66,25 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
++  (void)input_count;
++  (void)output_count;
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+@@ -78,9 +92,12 @@
+   (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Running make process**
+
+I'll go ahead and run `make` to check if the warnings have been resolved. I’m wondering if it’s a good idea to run `make clean` first; it might not be strictly necessary, but I can also directly use `make -f ...` to rebuild if needed. Let's keep things tidy!
+exec
+bash -lc 'make -f Makefile.nvc clean' in /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp succeeded in 12ms:
+rm -rf main main.o
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..c670d9c560e04e5072dfa4c0bb8bcc82fa69b3a6
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,12 +66,25 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
++  (void)input_count;
++  (void)output_count;
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+@@ -78,9 +92,12 @@
+   (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Building the project**
+exec
+bash -lc 'make -f Makefile.nvc' in /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp succeeded in 742ms:
+nvc++  -std=c++14 -Wall -I/root/codex_baseline/cuda_omp_workdir/gate_sdk -O3 -Minfo -mp=gpu -gpu=cc89 -c main.cpp -o main.o
+main:
+    241, Loop not vectorized/parallelized: contains call
+    245, Loop not vectorized/parallelized: contains call
+    256, Generating map(from:input_grad[:input_numel]) 
+         Generating map(to:output_grad[:output_numel],output[:output_numel],input[:input_numel]) 
+    258, Loop not vectorized/parallelized: contains call
+          60, Loop not vectorized: data dependency
+          74, FMA (fused multiply-add) instruction(s) generated
+    311, Loop not vectorized/parallelized: potential early exits
+void KernelPool2DGrad<AvgPoolGrad<float>, float>(int, float const*, float const*, float const*, int, int, int, int, int, int, int, int, int, int, int, AvgPoolGrad<float>, bool, float*, bool):
+    101, #omp target teams distribute parallel for num_teams(num_teams) thread_limit(256)
+        101, Generating "nvkernel__Z16KernelPool2DGradI11AvgPoolGradIfEfEviPKT0_S4_S4_iiiiiiiiiiiT_bPS2_b_F1L101_2" GPU kernel
+             Loop parallelized across teams and threads(128), schedule(static)
+    101, Generating implicit map(tofrom:pool_process) 
+         Generating map(tofrom:output_grad[:output_count],input_grad[:input_count],output_data[:output_count],input_data[:input_count]) 
+         Invariant if transformation
+         Loop not vectorized/parallelized: not countable
+         FMA (fused multiply-add) instruction(s) generated
+    161, Invariant if transformation
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..c670d9c560e04e5072dfa4c0bb8bcc82fa69b3a6
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,12 +66,25 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
++  (void)input_count;
++  (void)output_count;
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+@@ -78,9 +92,12 @@
+   (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Updating plan status**
+Plan update
+  ✓ Inspect existing main.cpp and identify required OpenMP offload translation strategy
+  ✓ Implement GPU-offloaded OpenMP version ensuring correctness and memory management
+  ✓ Build with make -f Makefile.nvc clean && make -f Makefile.nvc; adjust if needed
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..c670d9c560e04e5072dfa4c0bb8bcc82fa69b3a6
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,12 +66,25 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
++  (void)input_count;
++  (void)output_count;
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+@@ -78,9 +92,12 @@
+   (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Crafting final message summary**
+
+I'll construct a clear message outlining the changes made to accommodate the HPC architecture, specifically highlighting the target GPU and the modifications implemented in the code. I’ll ensure to mention the tests we've run and provide details on the lines impacted, following the required structure and guidelines. The specifics about `THREADS_PER_TEAM`, `system_info`, and best practices in HPC will be included as well. Additionally, I'll use `nl -ba` to gather the necessary line numbers for reference.
+exec
+bash -lc "nl -ba main.cpp | sed -n '1,260p'" in /root/codex_baseline/cuda_omp_workdir/data/src/pool-omp succeeded in 11ms:
+     1	#include <chrono>
+     2	#include <cmath>
+     3	#include <cstddef>
+     4	#include <cstdint>
+     5	#include <cstdio>
+     6	#include <cstdlib>
+     7	#include <new>
+     8	
+     9	#include <omp.h>
+    10	
+    11	constexpr int THREADS_PER_TEAM = 256;
+    12	
+    13	#pragma omp declare target
+    14	template <typename T>
+    15	constexpr T device_min(const T a, const T b) noexcept {
+    16	  return (a < b) ? a : b;
+    17	}
+    18	
+    19	template <typename T>
+    20	constexpr T device_max(const T a, const T b) noexcept {
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..c670d9c560e04e5072dfa4c0bb8bcc82fa69b3a6
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,12 +66,25 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
++  (void)input_count;
++  (void)output_count;
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+@@ -78,9 +92,12 @@
+   (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+
+thinking
+**Composing final message**
+
+I'll make sure the final message is structured clearly, highlighting the relevant code changes for the user. First, I'll introduce the main components addressing HPC optimizations, like the `map(present:)` usage and `thread_limit(256)`. I'll ensure to reference the appropriate lines from the code as instructed and summarize any tests run. Next, I'll create a bullet point list covering key modifications, and add suggestions for next steps, such as running the built application and profiling it for performance tuning. Let's ensure everything is clearly documented!
+codex
+**GPU Offload Pool Grad**
+- Recast the pooling gradient routine onto the GPU with `target teams distribute parallel for`, keeping helper math in a `declare target` block and locking `THREADS_PER_TEAM=256` to match the cc89 Ada SM warp granularity (`data/src/pool-omp/main.cpp:11-185`).
+- Derived device mapping sizes from runtime dimensions and reused them in `map(present: …)` clauses so the inner kernel operates entirely on resident data from the surrounding `target data` region, eliminating redundant host↔device transfers (`data/src/pool-omp/main.cpp:69-185`).
+- Retained the serial setup/verification path while timing only the GPU work inside a single `target data` region to minimize mapping overhead and keep correctness checks identical to the reference (`data/src/pool-omp/main.cpp:187-317`).
+
+Tests:
+- `make -f Makefile.nvc clean`
+- `make -f Makefile.nvc`
+
+Next steps:
+1. Run `./main <dims…>` to confirm runtime behavior on your target workload.
+2. Capture an Nsight Compute profile to validate occupancy and memory throughput assumptions.
+file update:
+diff --git a/cuda_omp_workdir/data/src/pool-omp/main.cpp b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+index 6ca157dca1040fdb02498e59ecb527ceddc352ab..c670d9c560e04e5072dfa4c0bb8bcc82fa69b3a6
+--- a/cuda_omp_workdir/data/src/pool-omp/main.cpp
++++ b/cuda_omp_workdir/data/src/pool-omp/main.cpp
+@@ -1,9 +1,10 @@
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <new>
+-#include <string>
+ 
+ #include <omp.h>
+ 
+@@ -65,12 +66,25 @@
+     return;
+   }
+ 
++  const std::int64_t spatial_hw =
++      static_cast<std::int64_t>(input_height) * static_cast<std::int64_t>(input_width);
++  const std::int64_t denom =
++      static_cast<std::int64_t>(channels) * (spatial_hw == 0 ? 1 : spatial_hw);
++  const int batch_size =
++      denom == 0 ? 0 : static_cast<int>(static_cast<std::int64_t>(nthreads) / denom);
++
+   const int input_hw = input_height * input_width;
+   const int output_hw = output_height * output_width;
+   const int channel_stride = input_hw;
+   const int batch_stride = channels * channel_stride;
+   const int batch_stride_nhwc = input_height * input_width * channels;
+   const T full_pool_inv = static_cast<T>(1.f / (ksize_height * ksize_width));
++  const std::size_t input_count = static_cast<std::size_t>(nthreads);
++  const std::size_t output_count =
++      static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(channels) *
++      static_cast<std::size_t>(output_height) * static_cast<std::size_t>(output_width);
++  (void)input_count;
++  (void)output_count;
+ 
+   const int team_size = THREADS_PER_TEAM;
+   const int computed_teams = (nthreads + team_size - 1) / team_size;
+@@ -78,9 +92,12 @@
+   (void)num_teams;
+ 
+ #pragma omp target teams distribute parallel for \
+-    num_teams(num_teams) thread_limit(team_size) \
+-    is_device_ptr(input_data, output_data, output_grad, input_grad) \
+-    firstprivate(pool_process) schedule(static, 1)
++    num_teams(num_teams) thread_limit(team_size) schedule(static, 1) \
++    map(present: input_data[0:input_count], \
++                 output_data[0:output_count], \
++                 output_grad[0:output_count], \
++                 input_grad[0:input_count]) \
++    firstprivate(pool_process)
+   for (int index = 0; index < nthreads; ++index) {
+     int batch_idx = 0;
+     int offsetC = 0;
+
+tokens used
+41,692

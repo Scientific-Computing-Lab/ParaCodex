@@ -1,0 +1,162 @@
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <chrono>
+#include <random>
+#include <cmath>
+#include <omp.h>
+
+template <typename T>
+void reference(
+    const T* input,
+    const T* dense,
+    T* output,
+    int embedding_dim,
+    int batch_size,
+    const int* offset)
+{
+  for (int batch_idx = 0; batch_idx < batch_size; batch_idx++) {
+    const int range = offset[batch_idx + 1] - offset[batch_idx];
+    for (int idx = 0; idx < embedding_dim; idx++) {
+      const T dense_elem = dense[batch_idx * embedding_dim + idx];
+      for (int nested_idx = idx; nested_idx < range; nested_idx += embedding_dim) {
+        output[offset[batch_idx] + nested_idx] =
+          input[offset[batch_idx] + nested_idx] + dense_elem;
+      }
+    }
+  }
+}
+
+int main(int argc, char* argv[])
+{
+  if (argc != 4) {
+    printf("Usage: %s <number of rows> <batch size> <repeat>\n", argv[0]);
+    return 1;
+  }
+  const int nrows = atoi(argv[1]);
+  const int batch_size = atoi(argv[2]);
+  const int repeat = atoi(argv[3]);
+  assert(nrows > batch_size * batch_size);
+
+  printf("Number of rows in the embedding table: %d\n", nrows);
+  printf("Batch size: %d\n", batch_size);
+
+  const int embed_dims[] = {768, 2048, 12288};
+
+  for (size_t n = 0; n < sizeof(embed_dims)/sizeof(int); n++) {
+    int ncols = embed_dims[n];
+    printf("\nEmbedding dimension: %d\n", ncols);
+
+    int input_size = nrows * ncols;
+
+    size_t input_size_bytes = input_size * sizeof(float);
+
+    int dense_size = batch_size * ncols ;
+    int dense_size_bytes = dense_size * sizeof(float);
+
+    int batch_size_bytes = (batch_size + 1) * sizeof(float);
+
+    float *input, *dense, *output_k1, *output_k2, *output_ref;
+    input = (float*) malloc (input_size_bytes);
+
+    dense = (float*) malloc (dense_size_bytes);
+
+    output_k1 = (float*) malloc (input_size_bytes);
+
+    output_k2 = (float*) malloc (input_size_bytes);
+
+    output_ref = (float*) malloc (input_size_bytes);
+
+    int *offset = (int*) malloc (batch_size_bytes);
+
+    srand(123);
+    offset[0] = 0;
+    for (int i = 1; i <= batch_size; i++)
+      offset[i] = offset[i-1] + (rand() % batch_size + 1) * ncols;
+
+    std::default_random_engine g (123);
+    std::uniform_real_distribution<float> distr (-1.f, 1.f);
+    for (int i = 0; i < dense_size; i++) {
+      dense[i] = distr(g);
+    }
+
+    for (int i = 0; i < input_size; i++) {
+      input[i] = distr(g);
+      output_k1[i] = output_k2[i] = output_ref[i] = 0;
+    }
+
+    reference(input, dense, output_ref, ncols, batch_size, offset);
+
+    {
+      for (int block_size = 128; block_size <= 1024; block_size = block_size * 2) {
+        printf("block size: %d\n", block_size);
+
+        auto start = std::chrono::steady_clock::now();
+
+        for (int i = 0; i < repeat; i++) {
+          {
+            {
+              const int batch_idx  = omp_get_team_num();
+
+              const int grain_size = omp_get_num_threads();
+              const int tid = omp_get_thread_num();
+              const int range = offset[batch_idx + 1] - offset[batch_idx];
+              for (int idx = tid; idx < ncols; idx += grain_size) {
+                const auto dense_elem = dense[batch_idx * ncols + idx];
+                for (int nested_idx = idx; nested_idx < range; nested_idx += ncols) {
+                  output_k1[offset[batch_idx] + nested_idx] = input[offset[batch_idx] + nested_idx] + dense_elem;
+                }
+              }
+            }
+          }
+        }
+
+        auto end = std::chrono::steady_clock::now();
+        auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        printf("Average execution time of dense embedding kernel (k1): %f (us)\n", (time * 1e-3f) / repeat);
+
+        start = std::chrono::steady_clock::now();
+
+        for (int i = 0; i < repeat; i++) {
+          {
+            {
+              const int batch_idx  = omp_get_team_num();
+
+              const int start = offset[batch_idx];
+              const int range = offset[batch_idx + 1] - start;
+              for (int idx = omp_get_thread_num(); idx < ncols; idx += omp_get_num_threads()) {
+                const auto dense_elem = dense[batch_idx * ncols + idx];
+                for (int nested_idx = idx; nested_idx < range; nested_idx += ncols) {
+                  output_k2[start + nested_idx] = input[start + nested_idx] + dense_elem;
+                }
+              }
+            }
+          }
+        }
+
+        end = std::chrono::steady_clock::now();
+        time = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        printf("Average execution time of dense embedding kernel (k2): %f (us)\n", (time * 1e-3f) / repeat);
+
+        bool ok = true;
+        for (int i = 0; i < input_size; i++) {
+          if (fabsf(output_k1[i] - output_ref[i]) > 1e-3f ||
+              fabsf(output_k2[i] - output_ref[i]) > 1e-3f) {
+            ok = false;
+            break;
+          }
+        }
+        printf("%s\n", ok ? "PASS" : "FAIL");
+      }
+    }
+
+    free(input);
+    free(dense);
+    free(output_k1);
+    free(output_k2);
+    free(output_ref);
+    free(offset);
+  }
+
+  return 0;
+}

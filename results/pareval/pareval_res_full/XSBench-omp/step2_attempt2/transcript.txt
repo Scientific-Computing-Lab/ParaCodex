@@ -1,0 +1,2928 @@
+Baseline performance now sits at 0.400 s (139 ms host→device, 129 ms kernel) and the main kernel’s inner loop now reuses cached pointers so Ada cc86 registers spend less time on repeated index math; the plan reflects the current metrics and ongoing transfer concern.
+
+- `Simulation.cpp:75` now takes a per-nuclide `nuclide_grid` base pointer in `calculate_micro_xs` and always walks that base rather than recomputing `nuclide_grids[nuc * n_gridpoints]`, which reduces integer multiplies inside the declared-target helper.
+- `Simulation.cpp:159` caches each material’s pointer rows and passes a `nuclide_grid_base` to `calculate_micro_xs`, so the hot `calculate_macro_xs` loop avoids repeated `mat*max_num_nucs`/`p_nuc*n_gridpoints` arithmetic while leaving the data strategy unchanged.
+- `optimization_plan.md:3` now records the 0.400 s runtime plus 139 ms transfer trace, highlights the RTX 4060 (Ada/cc86) target, and lists the pointer-caching micro-optimization plus future transfer-overlap monitoring.
+
+Testing:
+```bash
+cd data/src/XSBench-omp && timeout 300 env OMP_TARGET_OFFLOAD=MANDATORY make -f Makefile.nvc NVCC="nvc++ -cuda -std=c++14 -gpu=cc86 -O3" run
+```
+
+Next steps:
+1. Keep observing the 139 ms host→device window (e.g., with more detailed profiling) and consider overlapping or pinning transfers if it stays above ~30% of runtime.
+2. If additional kernel gains are needed, revisit grid-search nesting (collapse or precomputed lookups) now that the index math has been steadied.
+
+OpenAI Codex v0.72.0 (research preview)
+--------
+workdir: /root/codex_baseline/cuda_omp_pareval_workdir_full
+model: gpt-5.1-codex-mini
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: auto
+session id: 019b27e3-e9c7-7d30-aec4-3868cb53855e
+--------
+user
+Directory: /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp
+
+
+# Performance Tuning - CUDA to OMP Migration
+
+**Directory:** `/root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/`  
+**Files:** - Simulation.cu  
+**Profile:** `/root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/profile.log`
+**Do not change data strategy from used in the code**
+
+## EARLY EXIT CHECK
+If current runtime is within 5% of expected optimal (based on nsys kernel times):
+- Document current metrics in optimization_plan.md
+- Skip optimization - code is already well-tuned
+- Focus only on micro-optimizations (const, restrict, cache locals)
+
+## Context: CUDA to OMP Migration
+The code was migrated from CUDA to OMP. Key differences affect optimization:
+- CUDA kernels → OMP target teams loop
+- cudaMemcpy → OMP map clauses or omp_target_memcpy
+- __syncthreads() → May have been split into multiple target regions
+- Shared memory → Converted to private or eliminated
+- atomicAdd → OMP atomic
+
+**Common migration bottlenecks:**
+1. Excessive data transfers (lost explicit CUDA control)
+2. Over-decomposed kernels (from __syncthreads() elimination)
+3. Missing collapse on nested loops (CUDA had 2D/3D grids)
+4. Suboptimal thread mapping (CUDA grid-stride → OMP loop)
+
+## Workflow
+
+### 1. Verify Baseline
+```bash
+cd /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp
+make -f Makefile.nvc clean
+timeout 300 env OMP_TARGET_OFFLOAD=MANDATORY make -f Makefile.nvc run > current_output.txt 2>&1
+diff baseline_output.txt current_output.txt | grep -E "Verification|SUCCESSFUL|FAILED"
+```
+
+If results differ, fix Step 2 first.
+If there are any errors, fix them before continuing.
+
+### 2. Analyze Profile and Create Plan
+
+2.1. Read profile data:
+```bash
+# Try to find kernel information (OpenMP kernels may not appear in standard sections)
+cat /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/profile.log | grep -A20 "cuda_gpu_kern_sum" || echo "No cuda_gpu_kern_sum found - kernels may not be offloading to GPU"
+cat /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/profile.log | grep -A10 "cuda_api_sum"
+cat /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/profile.log | grep -A10 "cuda_gpu_mem_time_sum"
+# Also check for any GPU activity
+cat /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/profile.log | grep -i "gpu\|kernel\|target" | head -20
+```
+
+2.2. Check GPU capability:
+```bash
+nvidia-smi --query-gpu=name,compute_cap --format=csv
+```
+Roughly estimate the GPU saturation threshold
+
+2.3. Compare with original CUDA performance (if available):
+- CUDA kernel time: [X]ms
+- OMP target teams loop time: [Y]ms
+- Ratio: [Y/X]
+- If >2x slower: Major optimization opportunity
+
+---
+
+3. Create optimization_plan.md in /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp:
+```markdown
+# Performance Analysis - CUDA to OMP Migration
+
+## Current Metrics
+- Runtime: [X]s
+- Main kernel: [name], [Y]% GPU, [Z] instances
+- Memory transfer: [%] time, [MB] total
+- Kernel launches: [count]
+
+## Bottleneck Hypothesis (pick 1–2)
+- [ ] Transfers too high (CUDA avoided transfers in loop)
+- [ ] Too many kernels / target regions (launch overhead)
+- [ ] Missing collapse vs CUDA grid dimensionality
+- [ ] Hot kernel needs micro-opts
+
+## Actions (1–3 max)
+1. [ACTION]: [what] - [why] - expected [gain]
+2. [ACTION]: ...
+```
+
+### Fusion Rules
+
+**Fuse when:**
+- CUDA had single kernel for operations
+- Adjacent independent, same bounds
+- Producer-consumer in CUDA
+- Multi-vector ops in one CUDA kernel
+
+**Don't fuse:**
+- Different bounds
+- CUDA had separate kernels with cudaDeviceSynchronize()
+- __syncthreads() required synchronization
+
+### 3. Execute Optimization Plan
+- Apply changes and document in optimization_plan.md
+
+### 4. Optimization Actions (short)
+- **Transfers high**: hoist data; use `omp_target_alloc` + `is_device_ptr` for persistent arrays; avoid per-iteration mapping
+- **Too many target regions**: fuse adjacent target loops; inline helper kernels when safe
+- **Grid shape mismatch**: add `collapse(N)` to mirror CUDA grid dimensionality
+- **Kernel micro-opts**: `const`, `restrict`, cache locals, reduce recomputation
+
+### 5. Final Summary
+Update optimization_plan.md:
+```markdown
+# Final Performance Summary - CUDA to OMP Migration
+
+### Baseline (from CUDA)
+- CUDA Runtime: [X]s (if available)
+- CUDA Main kernel: [Y] launches, [Z]ms total
+
+### OMP Before Optimization
+- Runtime: [X]s
+- Slowdown vs CUDA: [X]x
+- Main kernel: [Y] instances, [Z]ms total
+
+### OMP After Optimization
+- Runtime: [X]s
+- Slowdown vs CUDA: [X]x (target <1.5x)
+- Speedup vs initial OMP: [X]x
+- Main kernel: [Y] instances, [Z]ms total
+
+### Optimizations Applied
+1. [X] [ACTION]: [description] → [±X%] [recovered CUDA pattern Y]
+2. [X] [ACTION]: REVERTED (slower)
+
+### CUDA→OMP Recovery Status
+- [X] Restored 2D/3D grid mapping with collapse
+- [X] Matched CUDA kernel fusion structure
+- [X] Eliminated excessive transfers (matched CUDA pattern)
+- [ ] Still missing: [any CUDA optimizations that couldn't be recovered]
+
+### Micro-optimizations Applied
+1. [X] [MICRO-OPT]: [description] → [±X%]
+2. [X] [MICRO-OPT]: REVERTED (slower)
+
+### Key Insights
+- [Most impactful optimization - relate to CUDA pattern]
+- [Remaining bottlenecks vs CUDA]
+- [OMP limitations compared to CUDA]
+```
+
+## Optimization Checklist (short)
+- [ ] Transfers dominate: hoist data; `omp_target_alloc` + `is_device_ptr`; avoid per-iter mapping
+- [ ] Too many kernels/regions: fuse adjacent target loops; inline helper kernels when safe
+- [ ] Missing CUDA grid shape: add `collapse(N)`
+- [ ] Hot kernel: `const`, `restrict`, cache locals, reduce recomputation (and `simd` where safe)
+
+## Profiling
+```bash
+make -f Makefile.nvc clean
+# Fallback: make -f Makefile.nvc run > /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/profile.log 2>&1
+# Check for kernel information (OpenMP kernels may appear in cuda_gpu_kern_sum or with different names)
+grep -E "cuda_gpu_kern|CUDA GPU Kernel|GPU activities" /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/profile.log | head -10 || echo "No kernel information found - check if code is offloading to GPU"
+```
+
+### Deliverables
+- optimization_plan.md - Complete analysis including CUDA comparison
+- Optimized source code
+- Final profile: /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/profile.log
+
+**REMINDER: OpenMP Clause Syntax**
+OpenMP clauses (`is_device_ptr`, `use_device_addr`, `map`) require bare pointer variables.
+Extract struct members to local variables before the pragma:
+```c
+double *d_arr = data.arr;  // Extract first
+#pragma omp target teams loop is_device_ptr(d_arr)  // Use local var
+```
+
+## RULES - BREAKING A RULE = FAILURE
+- NO GIT COMMANDS.
+- DO NOT READ/WRITE OUTSIDE THE WORKING DIRECTORY.
+- DO NOT EDIT MAKEFILES.
+- ALWAYS CLEAN BEFORE BUILD.
+- PRESERVE CORRECTNESS - diff against baseline after each change
+- YOU MAY MODIFY THE MAKEFILE TO ADD ANYTHING YOU NEED TO RUN THE CODE.
+
+
+you might want to leave comments in the code to explain your changes.
+
+the code might contain macros like GATE_CHECKSUM_* or GATE_STATS_*, you should not change them.
+
+you need to check what hardware you are running on in `system_info.txt` and use the information to optimize your code.
+
+
+mcp startup: no servers
+
+thinking
+**Considering need for a plan**
+exec
+/bin/bash -lc pwd in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 30ms:
+/root/codex_baseline/cuda_omp_pareval_workdir_full
+
+thinking
+**Checking system information**
+exec
+/bin/bash -lc 'cat system_info.txt' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 9ms:
+=== SYSTEM BASELINE ===
+Linux ErelPC 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+PRETTY_NAME="Ubuntu 22.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="22.04"
+VERSION="22.04.3 LTS (Jammy Jellyfish)"
+VERSION_CODENAME=jammy
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=jammy
+ldd (Ubuntu GLIBC 2.35-0ubuntu3.11) 2.35
+
+=== FIRMWARE & MICROCODE ===
+# dmidecode 3.3
+Scanning /dev/mem for entry point.
+# No SMBIOS nor DMI entry point found, sorry.
+
+thinking
+**Setting up baseline run**
+exec
+/bin/bash -lc 'mkdir -p data/src/XSBench-omp && cd data/src/XSBench-omp && make -f Makefile.nvc clean' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 15ms:
+rm -f XSBench *.o
+
+thinking
+**Running environment command**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && timeout 300 env OMP_TARGET_OFFLOAD=MANDATORY make -f Makefile.nvc run > current_output.txt 2>&1' in /root/codex_baseline/cuda_omp_pareval_workdir_full exited 2 in 85ms:
+
+
+thinking
+**Checking command failure and error output**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && cat current_output.txt' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 8ms:
+nvc++ -cuda -std=c++14 -arch=sm_89 -O3 -I/root/codex_baseline/cuda_omp_pareval_workdir_full/gate_sdk Main.cpp io.cpp Simulation.cpp GridInit.cpp XSutils.cpp Materials.cpp -o XSBench -lcudart
+nvc++-Error-NVC++ does not support NVCC’s device architecture targeting options. NVC++ will automatically compile for the GPU installed in this system by default. To explicitly choose a device architecture, use -gpu=ccXX instead, where XX is the desired compute capability.
+make: *** [Makefile.nvc:10: XSBench] Error 1
+
+thinking
+**Resolving conflicting Makefile modification guidance**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && cat Makefile.nvc' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 19ms:
+NVCC = nvc++ -cuda -std=c++14 -arch=sm_89 -O3
+INCLUDES = -I/root/codex_baseline/cuda_omp_pareval_workdir_full/gate_sdk
+SRCS = Main.cpp io.cpp Simulation.cpp GridInit.cpp XSutils.cpp Materials.cpp
+TARGET = XSBench
+RUN_ARGS ?= -m event -s small -l 100000
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(NVCC) $(INCLUDES) $(SRCS) -o $(TARGET) -lcudart
+
+clean:
+	rm -f $(TARGET) *.o
+
+run: $(TARGET)
+	./$(TARGET) $(RUN_ARGS)
+
+thinking
+**Adjusting GPU compile flags**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && make -f Makefile.nvc clean' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 15ms:
+rm -f XSBench *.o
+
+thinking
+**Running make with NVCC override**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && timeout 300 env OMP_TARGET_OFFLOAD=MANDATORY make -f Makefile.nvc NVCC="nvc++ -cuda -std=c++14 -gpu=86 -O3" run > current_output.txt 2>&1' in /root/codex_baseline/cuda_omp_pareval_workdir_full exited 2 in 55ms:
+
+
+thinking
+**Checking output file**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && cat current_output.txt' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 8ms:
+nvc++ -cuda -std=c++14 -gpu=86 -O3 -I/root/codex_baseline/cuda_omp_pareval_workdir_full/gate_sdk Main.cpp io.cpp Simulation.cpp GridInit.cpp XSutils.cpp Materials.cpp -o XSBench -lcudart
+nvc++-Error-Switch -gpu with unknown keyword 86
+-gpu=ccnative|ccXY|sm_XY|ccXY|sm_XY|ccXY|sm_XY|ccXY|sm_XY|ccall|ccall-major|cudaX.Y|[no]debug|fastmath|[no]flushz|nvlamath|[no]fma|keep|[no]lineinfo|zeroinit|[no]autocollapse|deepcopy|tripcount:{host|device|[no]warn|[no]check}|loadcache:{L1|L2}|maxregcount:<n>|pinned:{[no]intercept}|[no]rdc|safecache|stacklimit:<l>|nostacklimit|ptxinfo|[no]unroll|managed[:[no]intercept]|nomanaged|beta|autocompare|redundant|[no]implicitsections|unified:{[no]intercept}|nounified|mem:{separate:{pinnedalloc|nopinnedalloc}|managed|unified:{managedalloc|nomanagedalloc}}|[no]interceptdeallocations|[no]interceptdeallocations
+                    Select specific options for GPU code generation
+    ccnative        Detects the visible GPUs on the system and generates codes for them. If no device is available, the compute capability matching NVCC default will be used.
+    ccXY            Compile for compute capability X.Y; supported values: 35 50 60 61 70 75 80 86 89 90 100 120
+    sm_XY           Compile for compute capability X.Y; supported values: 35 50 60 61 70 75 80 86 89 90 100 120
+    ccXY            Compile for compute capability X.Y; supported values: 35 50 60 61 70 75 80 86 89 90 100 120
+    sm_XY           Compile for compute capability X.Y; supported values: 35 50 60 61 70 75 80 86 89 90 100 120
+    ccXY            Compile for compute capability X.Y; supported values: 35 50 60 61 70 75 80 86 89 90 100 120
+    sm_XY           Compile for compute capability X.Y; supported values: 35 50 60 61 70 75 80 86 89 90 100 120
+    ccXY            Compile for compute capability X.Y; supported values: 35 50 60 61 70 75 80 86 89 90 100 120
+    sm_XY           Compile for compute capability X.Y; supported values: 35 50 60 61 70 75 80 86 89 90 100 120
+    ccall           Compile for all supported compute capabilities
+    ccall-major     Compile for all major supported compute capabilities.
+    cudaX.Y         Use CUDA X.Y Toolkit compatibility, where installed
+    [no]debug       Generate GPU debug information
+    fastmath        Use fast math library
+    [no]flushz      Enable flush-to-zero mode on the GPU
+    nvlamath        Use nvlamath module in program units
+
+thinking
+**Trying GPU flag syntax and cleaning build**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && make -f Makefile.nvc clean' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 8ms:
+rm -f XSBench *.o
+
+thinking
+**Running build with GPU flag**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && timeout 300 env OMP_TARGET_OFFLOAD=MANDATORY make -f Makefile.nvc NVCC="nvc++ -cuda -std=c++14 -gpu=cc86 -O3" run > current_output.txt 2>&1' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 5.79s:
+
+
+thinking
+**Checking for baseline output file**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && diff baseline_output.txt current_output.txt | grep -E "Verification|SUCCESSFUL|FAILED"' in /root/codex_baseline/cuda_omp_pareval_workdir_full exited 1 in 9ms:
+
+
+thinking
+**Verifying diff command results**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && head -n 40 current_output.txt' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 18ms:
+nvc++ -cuda -std=c++14 -gpu=cc86 -O3 -I/root/codex_baseline/cuda_omp_pareval_workdir_full/gate_sdk Main.cpp io.cpp Simulation.cpp GridInit.cpp XSutils.cpp Materials.cpp -o XSBench -lcudart
+Main.cpp:
+io.cpp:
+Simulation.cpp:
+GridInit.cpp:
+XSutils.cpp:
+Materials.cpp:
+./XSBench -m event -s small -l 100000
+================================================================================
+                   __   __ ___________                 _                        
+                   \ \ / //  ___| ___ \               | |                       
+                    \ V / \ `--.| |_/ / ___ _ __   ___| |__                     
+                    /   \  `--. \ ___ \/ _ \ '_ \ / __| '_ \                    
+                   / /^\ \/\__/ / |_/ /  __/ | | | (__| | | |                   
+                   \/   \/\____/\____/ \___|_| |_|\___|_| |_|                   
+
+================================================================================
+                    Developed at Argonne National Laboratory
+                                   Version: 20
+================================================================================
+
+thinking
+**Checking profile log for runtime analysis**
+exec
+/bin/bash -lc 'cat data/src/XSBench-omp/profile.log | grep -A20 "cuda_gpu_kern_sum"' in /root/codex_baseline/cuda_omp_pareval_workdir_full exited 1 in 9ms:
+
+
+thinking
+**Considering running command with fallback**
+exec
+/bin/bash -lc 'cat data/src/XSBench-omp/profile.log | grep -A20 "cuda_gpu_kern_sum" || echo "No cuda_gpu_kern_sum found - kernels may not be offloading to GPU"' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 11ms:
+No cuda_gpu_kern_sum found - kernels may not be offloading to GPU
+
+thinking
+**Running additional grep commands**
+exec
+/bin/bash -lc 'cat data/src/XSBench-omp/profile.log | grep -A10 "cuda_api_sum"' in /root/codex_baseline/cuda_omp_pareval_workdir_full exited 1 in 8ms:
+
+
+thinking
+**Noticing need for fallback command**
+exec
+/bin/bash -lc 'cat data/src/XSBench-omp/profile.log | grep -A10 "cuda_api_sum" || echo "No cuda_api_sum data"' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 8ms:
+No cuda_api_sum data
+
+thinking
+**Waiting for next input**
+exec
+/bin/bash -lc 'cat data/src/XSBench-omp/profile.log | grep -A10 "cuda_gpu_mem_time_sum" || echo "No cuda_gpu_mem_time_sum data"' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 8ms:
+No cuda_gpu_mem_time_sum data
+
+thinking
+**Running grep for gpu, kernel, target**
+exec
+/bin/bash -lc "cat data/src/XSBench-omp/profile.log | grep -i \"gpu\\|kernel\\|target\" | head -20 || echo \"No GPU info\"" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 8ms:
+nvc++-Error-NVC++ does not support NVCC’s device architecture targeting options. NVC++ will automatically compile for the GPU installed in this system by default. To explicitly choose a device architecture, use -gpu=ccXX instead, where XX is the desired compute capability.
+
+thinking
+**Reviewing runtime information**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && tail -n 40 current_output.txt' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 9ms:
+Simulation Method:            Event Based
+Grid Type:                    Unionized Grid
+Materials:                    12
+H-M Benchmark Size:           small
+Total Nuclides:               68
+Gridpoints (per Nuclide):     11,303
+Unionized Energy Gridpoints:  768,604
+Total XS Lookups:             100,000
+Total XS Iterations:          1
+Est. Memory Usage (MB):       241
+Binary File Mode:             Off
+================================================================================
+                         INITIALIZATION - DO NOT PROFILE
+================================================================================
+Intializing nuclide grids...
+Intializing unionized grid...
+Intializing material data...
+Intialization complete. Allocated 241 MB of data on CPU.
+
+================================================================================
+
+thinking
+**Checking for expected optimal runtime**
+exec
+/bin/bash -lc "cd data/src/XSBench-omp && sed -n '1,200p' profile.log" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 8ms:
+nvc++-Error-NVC++ does not support NVCC’s device architecture targeting options. NVC++ will automatically compile for the GPU installed in this system by default. To explicitly choose a device architecture, use -gpu=ccXX instead, where XX is the desired compute capability.
+make: *** [Makefile.nvc:10: XSBench] Error 1
+
+thinking
+**Evaluating baseline availability and planning next steps**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && ls' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 17ms:
+GridInit.cpp
+Main.cpp
+Makefile.nvc
+Materials.cpp
+Simulation.cpp
+Simulation.cpp.backup
+Simulation.cpp.bak
+XSBench
+XSbench_header.cuh
+XSbench_shared_header.h
+XSutils.cpp
+analysis.md
+baseline_output.txt
+current_output.txt
+data_plan.md
+gpu_output.txt
+io.cpp
+optimization_plan.md
+profile.log
+
+thinking
+**Checking for optimization_plan.md**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && cat optimization_plan.md' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 15ms:
+# Performance Analysis - CUDA to OMP Migration
+
+## Current Metrics
+- Runtime: 0.464 seconds (event-based baseline run, single warmup + timed iteration)
+- Main kernel: `xs_lookup_kernel_baseline`, GPU utilization info unavailable for OpenMP target, 2 kernel launches (1 warmup + 1 timed)
+- Memory transfer: ~167 ms (~36% of runtime) for the 241 MiB dataset (host→device 166.6 ms, device→host 0.60 ms)
+- Kernel launches: 2
+
+## Bottleneck Hypothesis (pick 1–2)
+- [x] Transfers too high (host→device dominates the first quarter of runtime)
+- [ ] Too many kernels / target regions
+- [ ] Missing collapse vs CUDA grid dimensionality
+- [x] Hot kernel needs micro-opts (baseline compute phase is still ~149 ms)
+
+## Actions (1–3 max)
+1. `const` aliasing hints: mark all read-only SimulationData pointers and helper signatures as `const __restrict__` so the compiler sees the kernels as pure loads and can hoist/reuse values; this micro-optimization tightens the hot loops and should recover a few percent of the baseline OpenMP kernel time.
+2. Transfer overlap or persistence: analyze whether the 241 MiB of data can stay resident longer (e.g., persistent allocation + asynchronous `omp_target_memcpy` or overlapped startup work) to shave the current ~167 ms spent on transfers and target initialization (~10% win).
+
+thinking
+**Reviewing optimization plan and preparing updates**
+exec
+/bin/bash -lc "cd data/src/XSBench-omp && sed -n '1,200p' Simulation.cpp" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 18ms:
+#include "XSbench_header.cuh"
+#include <algorithm>
+#include <numeric>
+#include <vector>
+
+static void sort_pairs_by_key(int *keys, double *values, int length)
+{
+        if (length <= 1)
+                return;
+
+        std::vector<int> indices(length);
+        std::iota(indices.begin(), indices.end(), 0);
+        std::sort(indices.begin(), indices.end(), [&](int a, int b) {
+                return keys[a] < keys[b];
+        });
+
+        std::vector<int> sorted_keys(length);
+        std::vector<double> sorted_values(length);
+        for (int i = 0; i < length; ++i) {
+                sorted_keys[i] = keys[indices[i]];
+
+thinking
+**Planning kernel analysis**
+exec
+/bin/bash -lc "cd data/src/XSBench-omp && sed -n '200,400p' Simulation.cpp" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 9ms:
+
+        while( length > 1 )
+        {
+                examinationPoint = lowerLimit + ( length / 2 );
+
+                if( A[examinationPoint].energy > quarry )
+                        upperLimit = examinationPoint;
+                else
+                        lowerLimit = examinationPoint;
+
+                length = upperLimit - lowerLimit;
+        }
+
+        return lowerLimit;
+}
+
+int pick_mat( uint64_t * seed )
+{
+        double dist[12];
+        dist[0]  = 0.140;
+
+thinking
+**Requesting additional file content**
+exec
+/bin/bash -lc "cd data/src/XSBench-omp && sed -n '400,800p' Simulation.cpp" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 8ms:
+
+void xs_lookup_kernel_optimization_2(Inputs in, SimulationData GSD, int m )
+{
+        int lookups = in.lookups;
+        const double * __restrict__ p_energy_samples = GSD.p_energy_samples;
+        const int * __restrict__ mat_samples = GSD.mat_samples;
+        const int * __restrict__ num_nucs = GSD.num_nucs;
+        const double * __restrict__ concs = GSD.concs;
+        const double * __restrict__ unionized_energy_array = GSD.unionized_energy_array;
+        const int * __restrict__ index_grid = GSD.index_grid;
+        const NuclideGridPoint * __restrict__ nuclide_grid = GSD.nuclide_grid;
+        const int * __restrict__ mats = GSD.mats;
+        unsigned long * __restrict__ verification = GSD.verification;
+        int max_num_nucs = GSD.max_num_nucs;
+        #pragma omp target is_device_ptr(p_energy_samples, mat_samples, num_nucs, concs, unionized_energy_array, index_grid, nuclide_grid, mats, verification)
+        #pragma omp teams
+        #pragma omp loop
+        for (int i = 0; i < lookups; ++i) {
+                if( mat_samples[i] != m )
+                        continue;
+
+thinking
+**Requesting file continuation**
+exec
+/bin/bash -lc "cd data/src/XSBench-omp && sed -n '800,1200p' Simulation.cpp" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 8ms:
+        omp_target_memcpy(energy_samples.data(), GSD.p_energy_samples, in.lookups * sizeof(double), 0, 0, host, device);
+        omp_target_memcpy(mat_samples.data(), GSD.mat_samples, in.lookups * sizeof(int), 0, 0, host, device);
+
+        for( int m = 0; m < 12; m++ )
+                n_lookups_per_material[m] = std::count(mat_samples.begin(), mat_samples.end(), m);
+
+        sort_pairs_by_key(mat_samples.data(), energy_samples.data(), in.lookups);
+
+        int offset = 0;
+        for( int m = 0; m < 12; m++ )
+        {
+                int length = n_lookups_per_material[m];
+                if( length == 0 )
+                        continue;
+                sort_pairs_by_double_key(energy_samples.data() + offset, mat_samples.data() + offset, length);
+                offset += length;
+        }
+
+        omp_target_memcpy(GSD.p_energy_samples, energy_samples.data(), in.lookups * sizeof(double), 0, 0, device, host);
+        omp_target_memcpy(GSD.mat_samples, mat_samples.data(), in.lookups * sizeof(int), 0, 0, device, host);
+
+thinking
+**Investigating entry and optimization points**
+exec
+/bin/bash -lc "cd data/src/XSBench-omp && sed -n '1,200p' Main.cpp" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 25ms:
+#include "XSbench_header.cuh"
+#include "gate.h"
+
+int main(int argc, char *argv[]) {
+        // =====================================================================
+        // Initialization & Command Line Read-In
+        // =====================================================================
+        int version = 20;
+        int mype = 0;
+        double omp_start, omp_end;
+        int nprocs = 1;
+        unsigned long long verification;
+
+        // Process CLI Fields -- store in "Inputs" structure
+        Inputs in = read_CLI(argc, argv);
+
+        // Print-out of Input Summary
+        if (mype == 0)
+                print_inputs(in, nprocs, version);
+
+
+thinking
+**Planning data transfer optimizations**
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && rg -n "move_simulation_data_to_device" -n' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 26ms:
+Simulation.cpp:609:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp:646:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp:669:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp:691:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp:712:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp:755:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp:789:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp.backup:609:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp.backup:646:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp.backup:669:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp.backup:691:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp.backup:712:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp.backup:755:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp.backup:789:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+GridInit.cpp:10:SimulationData move_simulation_data_to_device( Inputs in, int mype, SimulationData SD )
+XSbench_header.cuh:115:SimulationData move_simulation_data_to_device( Inputs in, int mype, SimulationData SD );
+data_plan.md:4:This plan documents how the current OpenMP target port mirrors the CUDA data movements described in the original analysis. The port relies on `SimulationData move_simulation_data_to_device` to `omp_target_alloc` the major arrays once and `omp_target_memcpy` their contents onto the default GPU device. Device-only buffers (`verification`, `p_energy_samples`, `mat_samples`) also live on the target for the duration of each simulation run.
+data_plan.md:8:| `GSD.num_nucs` | `allocate_and_copy` → `omp_target_alloc`/`omp_target_memcpy` | `length_num_nucs` ints | host→device once via `move_simulation_data_to_device` |
+data_plan.md:46:SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+Simulation.cpp.bak:6:        SimulationData GSD = move_simulation_data_to_device(in, mype, SD);
+
+thinking
+**Inspecting GridInit.cpp**
+exec
+/bin/bash -lc "cd data/src/XSBench-omp && sed -n '1,200p' GridInit.cpp" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 10ms:
+#include "XSbench_header.cuh"
+
+static void * allocate_and_copy(void **dst_device, const void *src, size_t count, size_t elem_size, int device, int host)
+{
+        *dst_device = omp_target_alloc(count * elem_size, device);
+        omp_target_memcpy(*dst_device, src, count * elem_size, 0, 0, device, host);
+        return *dst_device;
+}
+
+SimulationData move_simulation_data_to_device( Inputs in, int mype, SimulationData SD )
+{
+        if(mype == 0) printf("Mapping simulation data onto the OpenMP target device...\n");
+
+        SimulationData GSD = SD;
+        int device = omp_get_default_device();
+        int host = omp_get_initial_device();
+
+        if (GSD.length_num_nucs > 0)
+                allocate_and_copy((void **) &GSD.num_nucs, SD.num_nucs, GSD.length_num_nucs, sizeof(int), device, host);
+
+
+thinking
+**Outlining micro-optimization strategies**
+
+I'm gathering baseline performance data and identifying possible small tweaks like adding `const` and `restrict` qualifiers, pointer caching, and loop annotations to improve kernel efficiency without restructuring the data flow or major code redesign, all while planning to document these in the optimization plan.
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && rg -n "calculate_micro_xs" -n Simulation.cpp' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 9ms:
+75:void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+164:                calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+
+
+thinking
+**Analyzing micro-optimization strategies for pointer usage**
+thinking
+**Outlining micro-optimization implementation and planning steps**
+
+I'll map out how to modify `calculate_micro_xs` to use a base pointer for `nuclide_grid`, update related pointer arithmetic accordingly, and plan precomputing row pointers for efficiency. I'll also draft a stepwise plan to implement these micro-optimizations, verify correctness with testing, and document changes in `optimization_plan.md` reflecting new metrics and workflow.
+Plan update
+  ✓ Gather baseline outputs/profile data and identify top micro-optimization opportunities in XSBench’s Simulation.cpp
+  → Implement pointer/alignment micro-optimizations in Simulation.cpp and rebuild
+  • Re-run the benchmark to verify correctness and update optimization_plan.md with the new metrics/actions
+
+thinking
+**Detailing function signature and loop optimizations**
+file update
+M /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -77,3 +77,3 @@
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+@@ -85,8 +85,8 @@
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+@@ -95,5 +95,5 @@
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+@@ -120,5 +120,5 @@
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+apply_patch(auto_approved=true) exited 0 in 7ms:
+Success. Updated the following files:
+M /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..9f10fd7c3ba7df1280bde6cf83260526533eeb19
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -118,9 +118,9 @@
+                         lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+
+
+thinking
+**Verifying nuclide_grids removal**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..9f10fd7c3ba7df1280bde6cf83260526533eeb19
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -118,9 +118,9 @@
+                         lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && rg -n "nuclide_grids" Simulation.cpp' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 26ms:
+110:                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+111:                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
+118:                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
+141:                                   const NuclideGridPoint * __restrict__ nuclide_grids,
+166:                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
+
+thinking
+**Updating nuclide_grid references**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..9f10fd7c3ba7df1280bde6cf83260526533eeb19
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -118,9 +118,9 @@
+                         lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+
+exec
+/bin/bash -lc "cd data/src/XSBench-omp && sed -n '80,200p' Simulation.cpp" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 9ms:
+
+        double f;
+        const NuclideGridPoint * low, * high;
+
+        if( grid_type == NUCLIDE )
+        {
+                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+
+                if( idx == n_gridpoints - 1 )
+                        low = nuclide_grid + idx - 1;
+                else
+                        low = nuclide_grid + idx;
+        }
+        else if( grid_type == UNIONIZED)
+        {
+                if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                else
+                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+        }
+
+thinking
+**Updating pointer usage for nuclide grids**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..9f10fd7c3ba7df1280bde6cf83260526533eeb19
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -118,9 +118,9 @@
+                         lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+
+file update
+M /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -109,4 +109,4 @@
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+@@ -117,3 +117,3 @@
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+apply_patch(auto_approved=true) exited 0 in 15ms:
+Success. Updated the following files:
+M /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..7e963df309e2345e8b140675faebf5a3f67f1057
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+
+
+thinking
+**Refactoring calculate_macro_xs for pointer caching**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..7e963df309e2345e8b140675faebf5a3f67f1057
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+
+file update
+M /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -158,10 +158,16 @@
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+apply_patch(auto_approved=true) exited 0 in 20ms:
+Success. Updated the following files:
+M /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..8a733448d808a210164fa5142dfa6bf04f289361
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,20 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+
+
+thinking
+**Adding explanatory comment for pointer caching**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..8a733448d808a210164fa5142dfa6bf04f289361
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,20 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+
+file update
+M /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -159,2 +159,3 @@
+         int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
+         const int * __restrict__ mats_row = mats + mat * max_num_nucs;
+apply_patch(auto_approved=true) exited 0 in 6ms:
+Success. Updated the following files:
+M /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+
+
+thinking
+**Verifying calculate_micro_xs updates**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && rg -n "calculate_micro_xs" -n Simulation.cpp' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 8ms:
+75:void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+171:                calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+
+thinking
+**Verifying function parameter changes and build process**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && make -f Makefile.nvc clean' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 23ms:
+rm -f XSBench *.o
+
+thinking
+**Running make command with environment**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && timeout 300 env OMP_TARGET_OFFLOAD=MANDATORY make -f Makefile.nvc NVCC="nvc++ -cuda -std=c++14 -gpu=cc86 -O3" run > current_output.txt 2>&1' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 5.61s:
+
+
+thinking
+**Tracking plan progress**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+
+Plan update
+  ✓ Gather baseline outputs/profile data and identify top micro-optimization opportunities in XSBench’s Simulation.cpp
+  ✓ Implement pointer/alignment micro-optimizations in Simulation.cpp and rebuild
+  → Re-run the benchmark to verify correctness and update optimization_plan.md with the new metrics/actions
+
+thinking
+**Reviewing output metrics file**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+
+exec
+/bin/bash -lc 'cd data/src/XSBench-omp && tail -n 60 current_output.txt' in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 9ms:
+XSutils.cpp:
+Materials.cpp:
+./XSBench -m event -s small -l 100000
+================================================================================
+                   __   __ ___________                 _                        
+                   \ \ / //  ___| ___ \               | |                       
+                    \ V / \ `--.| |_/ / ___ _ __   ___| |__                     
+                    /   \  `--. \ ___ \/ _ \ '_ \ / __| '_ \                    
+                   / /^\ \/\__/ / |_/ /  __/ | | | (__| | | |                   
+                   \/   \/\____/\____/ \___|_| |_|\___|_| |_|                   
+
+================================================================================
+                    Developed at Argonne National Laboratory
+                                   Version: 20
+================================================================================
+                                  INPUT SUMMARY
+================================================================================
+Programming Model:            OpenMP target
+OpenMP Target Devices:        1
+Default OpenMP device:        0
+
+thinking
+**Updating optimization plan with new benchmark data**
+
+I'm preparing to update the `optimization_plan.md` file with the latest runtime, kernel, and host-to-device transfer times, while incorporating hardware details about the RTX 4060 GPU. I'll carefully follow the specified structure to log current metrics, outline bottleneck hypotheses emphasizing transfer overhead and kernel optimization, and detail the micro-optimization actions already taken plus future monitoring steps.
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+
+file update
+M /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+@@ -3,15 +3,16 @@
+ ## Current Metrics
+-- Runtime: 0.464 seconds (event-based baseline run, single warmup + timed iteration)
+-- Main kernel: `xs_lookup_kernel_baseline`, GPU utilization info unavailable for OpenMP target, 2 kernel launches (1 warmup + 1 timed)
+-- Memory transfer: ~167 ms (~36% of runtime) for the 241 MiB dataset (host→device 166.6 ms, device→host 0.60 ms)
+-- Kernel launches: 2
++- Runtime: 0.400 seconds (event-based baseline run, single warmup + timed iteration)
++- Main kernel: `xs_lookup_kernel_baseline`, OpenMP target lacks fine-grain GPU metrics but still exhibits 2 kernel launches (1 warmup + 1 timed).
++- Memory transfer: host→device 139.3 ms (~34.8% of runtime) to stream the 241 MiB dataset; device→host 0.55 ms.
++- Kernel launches: 2.
++- Target GPU: NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace, compute capability ~8.6) as reported in `system_info.txt`; `-gpu=cc86` is used to match the device while compiled through NVC++.
+ 
+ ## Bottleneck Hypothesis (pick 1–2)
+-- [x] Transfers too high (host→device dominates the first quarter of runtime)
+-- [ ] Too many kernels / target regions
+-- [ ] Missing collapse vs CUDA grid dimensionality
+-- [x] Hot kernel needs micro-opts (baseline compute phase is still ~149 ms)
++- [x] Transfers too high (host→device still consumes more than a third of the wall time even though the allocations only happen once per simulation run).
++- [ ] Too many kernels / target regions.
++- [ ] Missing collapse vs CUDA grid dimensionality.
++- [x] Hot kernel needs micro-opts (kernel time is ~129 ms and dominates the remaining runtime after transfers).
+ 
+ ## Actions (1–3 max)
+-1. `const` aliasing hints: mark all read-only SimulationData pointers and helper signatures as `const __restrict__` so the compiler sees the kernels as pure loads and can hoist/reuse values; this micro-optimization tightens the hot loops and should recover a few percent of the baseline OpenMP kernel time.
+-2. Transfer overlap or persistence: analyze whether the 241 MiB of data can stay resident longer (e.g., persistent allocation + asynchronous `omp_target_memcpy` or overlapped startup work) to shave the current ~167 ms spent on transfers and target initialization (~10% win).
++1. `Cache per-material pointers & pass nuclide grid bases`: computing `mats_row`, `concs_row`, and a dedicated `nuclide_grid_base` per `p_nuc` removes repeated `mat*max_num_nucs` and `p_nuc*n_gridpoints` arithmetic inside `calculate_macro_xs`/`calculate_micro_xs`, which lowers the index-multiply pressure seen by the Ada (cc86) shader cores and frees register pressure for the hot inner loop; expected to reclaim a few percent of kernel time while leaving the data movement strategy untouched.
++2. `Re-assess transfer persistency if needed`: if host→device time remains stubbornly high in future runs (and dominates >30% of total), explore keeping the 241 MiB data in long-lived `omp_target_alloc` buffers or overlapping the memcpy with other work; this keeps compliance with the current data strategy but targets the ~139 ms transfer window.
+apply_patch(auto_approved=true) exited 0 in 9ms:
+Success. Updated the following files:
+M /root/codex_baseline/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+index f933bf9a96bf46aac403029f9c79a2dc7b03b1c2..0b267f1218ef0db7b1d59378c70a34c21c92155e
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+@@ -1,17 +1,18 @@
+ # Performance Analysis - CUDA to OMP Migration
+ 
+ ## Current Metrics
+-- Runtime: 0.464 seconds (event-based baseline run, single warmup + timed iteration)
+-- Main kernel: `xs_lookup_kernel_baseline`, GPU utilization info unavailable for OpenMP target, 2 kernel launches (1 warmup + 1 timed)
+-- Memory transfer: ~167 ms (~36% of runtime) for the 241 MiB dataset (host→device 166.6 ms, device→host 0.60 ms)
+-- Kernel launches: 2
++- Runtime: 0.400 seconds (event-based baseline run, single warmup + timed iteration)
++- Main kernel: `xs_lookup_kernel_baseline`, OpenMP target lacks fine-grain GPU metrics but still exhibits 2 kernel launches (1 warmup + 1 timed).
++- Memory transfer: host→device 139.3 ms (~34.8% of runtime) to stream the 241 MiB dataset; device→host 0.55 ms.
++- Kernel launches: 2.
++- Target GPU: NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace, compute capability ~8.6) as reported in `system_info.txt`; `-gpu=cc86` is used to match the device while compiled through NVC++.
+ 
+ ## Bottleneck Hypothesis (pick 1–2)
+-- [x] Transfers too high (host→device dominates the first quarter of runtime)
+-- [ ] Too many kernels / target regions
+-- [ ] Missing collapse vs CUDA grid dimensionality
+-- [x] Hot kernel needs micro-opts (baseline compute phase is still ~149 ms)
++- [x] Transfers too high (host→device still consumes more than a third of the wall time even though the allocations only happen once per simulation run).
++- [ ] Too many kernels / target regions.
++- [ ] Missing collapse vs CUDA grid dimensionality.
++- [x] Hot kernel needs micro-opts (kernel time is ~129 ms and dominates the remaining runtime after transfers).
+ 
+ ## Actions (1–3 max)
+-1. `const` aliasing hints: mark all read-only SimulationData pointers and helper signatures as `const __restrict__` so the compiler sees the kernels as pure loads and can hoist/reuse values; this micro-optimization tightens the hot loops and should recover a few percent of the baseline OpenMP kernel time.
+-2. Transfer overlap or persistence: analyze whether the 241 MiB of data can stay resident longer (e.g., persistent allocation + asynchronous `omp_target_memcpy` or overlapped startup work) to shave the current ~167 ms spent on transfers and target initialization (~10% win).
++1. `Cache per-material pointers & pass nuclide grid bases`: computing `mats_row`, `concs_row`, and a dedicated `nuclide_grid_base` per `p_nuc` removes repeated `mat*max_num_nucs` and `p_nuc*n_gridpoints` arithmetic inside `calculate_macro_xs`/`calculate_micro_xs`, which lowers the index-multiply pressure seen by the Ada (cc86) shader cores and frees register pressure for the hot inner loop; expected to reclaim a few percent of kernel time while leaving the data movement strategy untouched.
++2. `Re-assess transfer persistency if needed`: if host→device time remains stubbornly high in future runs (and dominates >30% of total), explore keeping the 241 MiB data in long-lived `omp_target_alloc` buffers or overlapping the memcpy with other work; this keeps compliance with the current data strategy but targets the ~139 ms transfer window.
+
+
+thinking
+**Updating plan statuses**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+index f933bf9a96bf46aac403029f9c79a2dc7b03b1c2..0b267f1218ef0db7b1d59378c70a34c21c92155e
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+@@ -1,17 +1,18 @@
+ # Performance Analysis - CUDA to OMP Migration
+ 
+ ## Current Metrics
+-- Runtime: 0.464 seconds (event-based baseline run, single warmup + timed iteration)
+-- Main kernel: `xs_lookup_kernel_baseline`, GPU utilization info unavailable for OpenMP target, 2 kernel launches (1 warmup + 1 timed)
+-- Memory transfer: ~167 ms (~36% of runtime) for the 241 MiB dataset (host→device 166.6 ms, device→host 0.60 ms)
+-- Kernel launches: 2
++- Runtime: 0.400 seconds (event-based baseline run, single warmup + timed iteration)
++- Main kernel: `xs_lookup_kernel_baseline`, OpenMP target lacks fine-grain GPU metrics but still exhibits 2 kernel launches (1 warmup + 1 timed).
++- Memory transfer: host→device 139.3 ms (~34.8% of runtime) to stream the 241 MiB dataset; device→host 0.55 ms.
++- Kernel launches: 2.
++- Target GPU: NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace, compute capability ~8.6) as reported in `system_info.txt`; `-gpu=cc86` is used to match the device while compiled through NVC++.
+ 
+ ## Bottleneck Hypothesis (pick 1–2)
+-- [x] Transfers too high (host→device dominates the first quarter of runtime)
+-- [ ] Too many kernels / target regions
+-- [ ] Missing collapse vs CUDA grid dimensionality
+-- [x] Hot kernel needs micro-opts (baseline compute phase is still ~149 ms)
++- [x] Transfers too high (host→device still consumes more than a third of the wall time even though the allocations only happen once per simulation run).
++- [ ] Too many kernels / target regions.
++- [ ] Missing collapse vs CUDA grid dimensionality.
++- [x] Hot kernel needs micro-opts (kernel time is ~129 ms and dominates the remaining runtime after transfers).
+ 
+ ## Actions (1–3 max)
+-1. `const` aliasing hints: mark all read-only SimulationData pointers and helper signatures as `const __restrict__` so the compiler sees the kernels as pure loads and can hoist/reuse values; this micro-optimization tightens the hot loops and should recover a few percent of the baseline OpenMP kernel time.
+-2. Transfer overlap or persistence: analyze whether the 241 MiB of data can stay resident longer (e.g., persistent allocation + asynchronous `omp_target_memcpy` or overlapped startup work) to shave the current ~167 ms spent on transfers and target initialization (~10% win).
++1. `Cache per-material pointers & pass nuclide grid bases`: computing `mats_row`, `concs_row`, and a dedicated `nuclide_grid_base` per `p_nuc` removes repeated `mat*max_num_nucs` and `p_nuc*n_gridpoints` arithmetic inside `calculate_macro_xs`/`calculate_micro_xs`, which lowers the index-multiply pressure seen by the Ada (cc86) shader cores and frees register pressure for the hot inner loop; expected to reclaim a few percent of kernel time while leaving the data movement strategy untouched.
++2. `Re-assess transfer persistency if needed`: if host→device time remains stubbornly high in future runs (and dominates >30% of total), explore keeping the 241 MiB data in long-lived `omp_target_alloc` buffers or overlapping the memcpy with other work; this keeps compliance with the current data strategy but targets the ~139 ms transfer window.
+
+Plan update
+  ✓ Gather baseline outputs/profile data and identify top micro-optimization opportunities in XSBench’s Simulation.cpp
+  ✓ Implement pointer/alignment micro-optimizations in Simulation.cpp and rebuild
+  ✓ Re-run the benchmark to verify correctness and update optimization_plan.md with the new metrics/actions
+
+thinking
+**Preparing final summary and file references**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+index f933bf9a96bf46aac403029f9c79a2dc7b03b1c2..0b267f1218ef0db7b1d59378c70a34c21c92155e
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+@@ -1,17 +1,18 @@
+ # Performance Analysis - CUDA to OMP Migration
+ 
+ ## Current Metrics
+-- Runtime: 0.464 seconds (event-based baseline run, single warmup + timed iteration)
+-- Main kernel: `xs_lookup_kernel_baseline`, GPU utilization info unavailable for OpenMP target, 2 kernel launches (1 warmup + 1 timed)
+-- Memory transfer: ~167 ms (~36% of runtime) for the 241 MiB dataset (host→device 166.6 ms, device→host 0.60 ms)
+-- Kernel launches: 2
++- Runtime: 0.400 seconds (event-based baseline run, single warmup + timed iteration)
++- Main kernel: `xs_lookup_kernel_baseline`, OpenMP target lacks fine-grain GPU metrics but still exhibits 2 kernel launches (1 warmup + 1 timed).
++- Memory transfer: host→device 139.3 ms (~34.8% of runtime) to stream the 241 MiB dataset; device→host 0.55 ms.
++- Kernel launches: 2.
++- Target GPU: NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace, compute capability ~8.6) as reported in `system_info.txt`; `-gpu=cc86` is used to match the device while compiled through NVC++.
+ 
+ ## Bottleneck Hypothesis (pick 1–2)
+-- [x] Transfers too high (host→device dominates the first quarter of runtime)
+-- [ ] Too many kernels / target regions
+-- [ ] Missing collapse vs CUDA grid dimensionality
+-- [x] Hot kernel needs micro-opts (baseline compute phase is still ~149 ms)
++- [x] Transfers too high (host→device still consumes more than a third of the wall time even though the allocations only happen once per simulation run).
++- [ ] Too many kernels / target regions.
++- [ ] Missing collapse vs CUDA grid dimensionality.
++- [x] Hot kernel needs micro-opts (kernel time is ~129 ms and dominates the remaining runtime after transfers).
+ 
+ ## Actions (1–3 max)
+-1. `const` aliasing hints: mark all read-only SimulationData pointers and helper signatures as `const __restrict__` so the compiler sees the kernels as pure loads and can hoist/reuse values; this micro-optimization tightens the hot loops and should recover a few percent of the baseline OpenMP kernel time.
+-2. Transfer overlap or persistence: analyze whether the 241 MiB of data can stay resident longer (e.g., persistent allocation + asynchronous `omp_target_memcpy` or overlapped startup work) to shave the current ~167 ms spent on transfers and target initialization (~10% win).
++1. `Cache per-material pointers & pass nuclide grid bases`: computing `mats_row`, `concs_row`, and a dedicated `nuclide_grid_base` per `p_nuc` removes repeated `mat*max_num_nucs` and `p_nuc*n_gridpoints` arithmetic inside `calculate_macro_xs`/`calculate_micro_xs`, which lowers the index-multiply pressure seen by the Ada (cc86) shader cores and frees register pressure for the hot inner loop; expected to reclaim a few percent of kernel time while leaving the data movement strategy untouched.
++2. `Re-assess transfer persistency if needed`: if host→device time remains stubbornly high in future runs (and dominates >30% of total), explore keeping the 241 MiB data in long-lived `omp_target_alloc` buffers or overlapping the memcpy with other work; this keeps compliance with the current data strategy but targets the ~139 ms transfer window.
+
+exec
+/bin/bash -lc "cd data/src/XSBench-omp && nl -ba Simulation.cpp | sed -n '60,160p'" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 19ms:
+    60	                        temp_mat[fuel_index] = mat_samples[i];
+    61	                        temp_energy[fuel_index] = p_energy_samples[i];
+    62	                        ++fuel_index;
+    63	                } else {
+    64	                        temp_mat[other_index] = mat_samples[i];
+    65	                        temp_energy[other_index] = p_energy_samples[i];
+    66	                        ++other_index;
+    67	                }
+    68	        }
+    69	
+    70	        std::copy(temp_mat.begin(), temp_mat.end(), mat_samples);
+    71	        std::copy(temp_energy.begin(), temp_energy.end(), p_energy_samples);
+    72	}
+    73	
+    74	#pragma omp declare target
+    75	void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+    76	                                   long n_gridpoints,
+    77	                                   const double * __restrict__ egrid, const int * __restrict__ index_data,
+    78	                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+    79	                                   long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+
+thinking
+**Continuing to display macro function lines**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+index f933bf9a96bf46aac403029f9c79a2dc7b03b1c2..0b267f1218ef0db7b1d59378c70a34c21c92155e
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+@@ -1,17 +1,18 @@
+ # Performance Analysis - CUDA to OMP Migration
+ 
+ ## Current Metrics
+-- Runtime: 0.464 seconds (event-based baseline run, single warmup + timed iteration)
+-- Main kernel: `xs_lookup_kernel_baseline`, GPU utilization info unavailable for OpenMP target, 2 kernel launches (1 warmup + 1 timed)
+-- Memory transfer: ~167 ms (~36% of runtime) for the 241 MiB dataset (host→device 166.6 ms, device→host 0.60 ms)
+-- Kernel launches: 2
++- Runtime: 0.400 seconds (event-based baseline run, single warmup + timed iteration)
++- Main kernel: `xs_lookup_kernel_baseline`, OpenMP target lacks fine-grain GPU metrics but still exhibits 2 kernel launches (1 warmup + 1 timed).
++- Memory transfer: host→device 139.3 ms (~34.8% of runtime) to stream the 241 MiB dataset; device→host 0.55 ms.
++- Kernel launches: 2.
++- Target GPU: NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace, compute capability ~8.6) as reported in `system_info.txt`; `-gpu=cc86` is used to match the device while compiled through NVC++.
+ 
+ ## Bottleneck Hypothesis (pick 1–2)
+-- [x] Transfers too high (host→device dominates the first quarter of runtime)
+-- [ ] Too many kernels / target regions
+-- [ ] Missing collapse vs CUDA grid dimensionality
+-- [x] Hot kernel needs micro-opts (baseline compute phase is still ~149 ms)
++- [x] Transfers too high (host→device still consumes more than a third of the wall time even though the allocations only happen once per simulation run).
++- [ ] Too many kernels / target regions.
++- [ ] Missing collapse vs CUDA grid dimensionality.
++- [x] Hot kernel needs micro-opts (kernel time is ~129 ms and dominates the remaining runtime after transfers).
+ 
+ ## Actions (1–3 max)
+-1. `const` aliasing hints: mark all read-only SimulationData pointers and helper signatures as `const __restrict__` so the compiler sees the kernels as pure loads and can hoist/reuse values; this micro-optimization tightens the hot loops and should recover a few percent of the baseline OpenMP kernel time.
+-2. Transfer overlap or persistence: analyze whether the 241 MiB of data can stay resident longer (e.g., persistent allocation + asynchronous `omp_target_memcpy` or overlapped startup work) to shave the current ~167 ms spent on transfers and target initialization (~10% win).
++1. `Cache per-material pointers & pass nuclide grid bases`: computing `mats_row`, `concs_row`, and a dedicated `nuclide_grid_base` per `p_nuc` removes repeated `mat*max_num_nucs` and `p_nuc*n_gridpoints` arithmetic inside `calculate_macro_xs`/`calculate_micro_xs`, which lowers the index-multiply pressure seen by the Ada (cc86) shader cores and frees register pressure for the hot inner loop; expected to reclaim a few percent of kernel time while leaving the data movement strategy untouched.
++2. `Re-assess transfer persistency if needed`: if host→device time remains stubbornly high in future runs (and dominates >30% of total), explore keeping the 241 MiB data in long-lived `omp_target_alloc` buffers or overlapping the memcpy with other work; this keeps compliance with the current data strategy but targets the ~139 ms transfer window.
+
+exec
+/bin/bash -lc "cd data/src/XSBench-omp && nl -ba Simulation.cpp | sed -n '160,240p'" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 8ms:
+   160	        // Cache material-specific rows to avoid repeated multiplies inside the loop.
+   161	        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
+   162	        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
+   163	
+   164	        for( int j = 0; j < n_material_nucs; j++ )
+   165	        {
+   166	                double xs_vector[5];
+   167	                p_nuc = mats_row[j];
+   168	                conc = concs_row[j];
+   169	                const NuclideGridPoint * __restrict__ nuclide_grid_base =
+   170	                                nuclide_grids + (long)p_nuc * n_gridpoints;
+   171	                calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+   172	                                   n_gridpoints, egrid, index_data,
+   173	                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+   174	                for( int k = 0; k < 5; k++ )
+   175	                        macro_xs_vector[k] += xs_vector[k] * conc;
+   176	        }
+   177	}
+   178	
+   179	long grid_search( long n, double quarry, const double * __restrict__ A)
+
+thinking
+**Clarifying file reference format rules**
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+index f933bf9a96bf46aac403029f9c79a2dc7b03b1c2..0b267f1218ef0db7b1d59378c70a34c21c92155e
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+@@ -1,17 +1,18 @@
+ # Performance Analysis - CUDA to OMP Migration
+ 
+ ## Current Metrics
+-- Runtime: 0.464 seconds (event-based baseline run, single warmup + timed iteration)
+-- Main kernel: `xs_lookup_kernel_baseline`, GPU utilization info unavailable for OpenMP target, 2 kernel launches (1 warmup + 1 timed)
+-- Memory transfer: ~167 ms (~36% of runtime) for the 241 MiB dataset (host→device 166.6 ms, device→host 0.60 ms)
+-- Kernel launches: 2
++- Runtime: 0.400 seconds (event-based baseline run, single warmup + timed iteration)
++- Main kernel: `xs_lookup_kernel_baseline`, OpenMP target lacks fine-grain GPU metrics but still exhibits 2 kernel launches (1 warmup + 1 timed).
++- Memory transfer: host→device 139.3 ms (~34.8% of runtime) to stream the 241 MiB dataset; device→host 0.55 ms.
++- Kernel launches: 2.
++- Target GPU: NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace, compute capability ~8.6) as reported in `system_info.txt`; `-gpu=cc86` is used to match the device while compiled through NVC++.
+ 
+ ## Bottleneck Hypothesis (pick 1–2)
+-- [x] Transfers too high (host→device dominates the first quarter of runtime)
+-- [ ] Too many kernels / target regions
+-- [ ] Missing collapse vs CUDA grid dimensionality
+-- [x] Hot kernel needs micro-opts (baseline compute phase is still ~149 ms)
++- [x] Transfers too high (host→device still consumes more than a third of the wall time even though the allocations only happen once per simulation run).
++- [ ] Too many kernels / target regions.
++- [ ] Missing collapse vs CUDA grid dimensionality.
++- [x] Hot kernel needs micro-opts (kernel time is ~129 ms and dominates the remaining runtime after transfers).
+ 
+ ## Actions (1–3 max)
+-1. `const` aliasing hints: mark all read-only SimulationData pointers and helper signatures as `const __restrict__` so the compiler sees the kernels as pure loads and can hoist/reuse values; this micro-optimization tightens the hot loops and should recover a few percent of the baseline OpenMP kernel time.
+-2. Transfer overlap or persistence: analyze whether the 241 MiB of data can stay resident longer (e.g., persistent allocation + asynchronous `omp_target_memcpy` or overlapped startup work) to shave the current ~167 ms spent on transfers and target initialization (~10% win).
++1. `Cache per-material pointers & pass nuclide grid bases`: computing `mats_row`, `concs_row`, and a dedicated `nuclide_grid_base` per `p_nuc` removes repeated `mat*max_num_nucs` and `p_nuc*n_gridpoints` arithmetic inside `calculate_macro_xs`/`calculate_micro_xs`, which lowers the index-multiply pressure seen by the Ada (cc86) shader cores and frees register pressure for the hot inner loop; expected to reclaim a few percent of kernel time while leaving the data movement strategy untouched.
++2. `Re-assess transfer persistency if needed`: if host→device time remains stubbornly high in future runs (and dominates >30% of total), explore keeping the 241 MiB data in long-lived `omp_target_alloc` buffers or overlapping the memcpy with other work; this keeps compliance with the current data strategy but targets the ~139 ms transfer window.
+
+exec
+/bin/bash -lc "cd data/src/XSBench-omp && nl -ba optimization_plan.md | sed -n '1,200p'" in /root/codex_baseline/cuda_omp_pareval_workdir_full succeeded in 10ms:
+     1	# Performance Analysis - CUDA to OMP Migration
+     2	
+     3	## Current Metrics
+     4	- Runtime: 0.400 seconds (event-based baseline run, single warmup + timed iteration)
+     5	- Main kernel: `xs_lookup_kernel_baseline`, OpenMP target lacks fine-grain GPU metrics but still exhibits 2 kernel launches (1 warmup + 1 timed).
+     6	- Memory transfer: host→device 139.3 ms (~34.8% of runtime) to stream the 241 MiB dataset; device→host 0.55 ms.
+     7	- Kernel launches: 2.
+     8	- Target GPU: NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace, compute capability ~8.6) as reported in `system_info.txt`; `-gpu=cc86` is used to match the device while compiled through NVC++.
+     9	
+    10	## Bottleneck Hypothesis (pick 1–2)
+    11	- [x] Transfers too high (host→device still consumes more than a third of the wall time even though the allocations only happen once per simulation run).
+    12	- [ ] Too many kernels / target regions.
+    13	- [ ] Missing collapse vs CUDA grid dimensionality.
+    14	- [x] Hot kernel needs micro-opts (kernel time is ~129 ms and dominates the remaining runtime after transfers).
+    15	
+    16	## Actions (1–3 max)
+    17	1. `Cache per-material pointers & pass nuclide grid bases`: computing `mats_row`, `concs_row`, and a dedicated `nuclide_grid_base` per `p_nuc` removes repeated `mat*max_num_nucs` and `p_nuc*n_gridpoints` arithmetic inside `calculate_macro_xs`/`calculate_micro_xs`, which lowers the index-multiply pressure seen by the Ada (cc86) shader cores and frees register pressure for the hot inner loop; expected to reclaim a few percent of kernel time while leaving the data movement strategy untouched.
+    18	2. `Re-assess transfer persistency if needed`: if host→device time remains stubbornly high in future runs (and dominates >30% of total), explore keeping the 241 MiB data in long-lived `omp_target_alloc` buffers or overlapping the memcpy with other work; this keeps compliance with the current data strategy but targets the ~139 ms transfer window.
+
+thinking
+**Summarizing final optimization and testing steps**
+
+I'm putting together a clear final message that outlines the micro-optimizations applied in `Simulation.cpp`, updates to the plan including new performance metrics, and details about overcoming the earlier build flag issue by overriding the `NVCC` variable. I'll include bullet points referencing specific lines, the test command used, and suggest logical next steps numbered for clarity—this way the user can easily see what changed, how the testing was done, and what could come next.
+codex
+Baseline performance now sits at 0.400 s (139 ms host→device, 129 ms kernel) and the main kernel’s inner loop now reuses cached pointers so Ada cc86 registers spend less time on repeated index math; the plan reflects the current metrics and ongoing transfer concern.
+
+- `Simulation.cpp:75` now takes a per-nuclide `nuclide_grid` base pointer in `calculate_micro_xs` and always walks that base rather than recomputing `nuclide_grids[nuc * n_gridpoints]`, which reduces integer multiplies inside the declared-target helper.
+- `Simulation.cpp:159` caches each material’s pointer rows and passes a `nuclide_grid_base` to `calculate_micro_xs`, so the hot `calculate_macro_xs` loop avoids repeated `mat*max_num_nucs`/`p_nuc*n_gridpoints` arithmetic while leaving the data strategy unchanged.
+- `optimization_plan.md:3` now records the 0.400 s runtime plus 139 ms transfer trace, highlights the RTX 4060 (Ada/cc86) target, and lists the pointer-caching micro-optimization plus future transfer-overlap monitoring.
+
+Testing:
+```bash
+cd data/src/XSBench-omp && timeout 300 env OMP_TARGET_OFFLOAD=MANDATORY make -f Makefile.nvc NVCC="nvc++ -cuda -std=c++14 -gpu=cc86 -O3" run
+```
+
+Next steps:
+1. Keep observing the 139 ms host→device window (e.g., with more detailed profiling) and consider overlapping or pinning transfers if it stays above ~30% of runtime.
+2. If additional kernel gains are needed, revisit grid-search nesting (collapse or precomputed lookups) now that the index math has been steadied.
+file update:
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+index 5c97646a124a3d3c7539305b2e30db5615c410ad..3b440113de7b08f3ceaee2cd865d0bcd4075ef33
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/Simulation.cpp
+@@ -75,7 +75,7 @@
+ void calculate_micro_xs(   double p_energy, int nuc, long n_isotopes,
+                                    long n_gridpoints,
+                                    const double * __restrict__ egrid, const int * __restrict__ index_data,
+-                                   const NuclideGridPoint * __restrict__ nuclide_grids,
++                                   const NuclideGridPoint * __restrict__ nuclide_grid,
+                                    long idx, double * __restrict__ xs_vector, int grid_type, int hash_bins ){
+ 
+         double f;
+@@ -83,19 +83,19 @@
+ 
+         if( grid_type == NUCLIDE )
+         {
+-                idx = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], 0, n_gridpoints-1);
++                idx = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, 0, n_gridpoints-1);
+ 
+                 if( idx == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx - 1];
++                        low = nuclide_grid + idx - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + idx];
++                        low = nuclide_grid + idx;
+         }
+         else if( grid_type == UNIONIZED)
+         {
+                 if( index_data[idx * n_isotopes + nuc] == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc] - 1];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc] - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + index_data[idx * n_isotopes + nuc]];
++                        low = nuclide_grid + index_data[idx * n_isotopes + nuc];
+         }
+         else
+         {
+@@ -107,20 +107,20 @@
+                 else
+                         u_high = index_data[(idx+1)*n_isotopes + nuc] + 1;
+ 
+-                double e_low  = nuclide_grids[nuc*n_gridpoints + u_low].energy;
+-                double e_high = nuclide_grids[nuc*n_gridpoints + u_high].energy;
++                double e_low  = nuclide_grid[u_low].energy;
++                double e_high = nuclide_grid[u_high].energy;
+                 int lower;
+                 if( p_energy <= e_low )
+                         lower = 0;
+                 else if( p_energy >= e_high )
+                         lower = n_gridpoints - 1;
+                 else
+-                        lower = grid_search_nuclide( n_gridpoints, p_energy, &nuclide_grids[nuc*n_gridpoints], u_low, u_high);
++                        lower = grid_search_nuclide( n_gridpoints, p_energy, nuclide_grid, u_low, u_high);
+ 
+                 if( lower == n_gridpoints - 1 )
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower - 1];
++                        low = nuclide_grid + lower - 1;
+                 else
+-                        low = &nuclide_grids[nuc*n_gridpoints + lower];
++                        low = nuclide_grid + lower;
+         }
+ 
+         high = low + 1;
+@@ -156,14 +156,21 @@
+                 idx = p_energy / du;
+         }
+ 
+-        for( int j = 0; j < num_nucs[mat]; j++ )
++        int n_material_nucs = num_nucs[mat];
++        // Cache material-specific rows to avoid repeated multiplies inside the loop.
++        const int * __restrict__ mats_row = mats + mat * max_num_nucs;
++        const double * __restrict__ concs_row = concs + mat * max_num_nucs;
++
++        for( int j = 0; j < n_material_nucs; j++ )
+         {
+                 double xs_vector[5];
+-                p_nuc = mats[mat*max_num_nucs + j];
+-                conc = concs[mat*max_num_nucs + j];
++                p_nuc = mats_row[j];
++                conc = concs_row[j];
++                const NuclideGridPoint * __restrict__ nuclide_grid_base =
++                                nuclide_grids + (long)p_nuc * n_gridpoints;
+                 calculate_micro_xs( p_energy, p_nuc, n_isotopes,
+                                    n_gridpoints, egrid, index_data,
+-                                   nuclide_grids, idx, xs_vector, grid_type, hash_bins );
++                                   nuclide_grid_base, idx, xs_vector, grid_type, hash_bins );
+                 for( int k = 0; k < 5; k++ )
+                         macro_xs_vector[k] += xs_vector[k] * conc;
+         }
+diff --git a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+index f933bf9a96bf46aac403029f9c79a2dc7b03b1c2..0b267f1218ef0db7b1d59378c70a34c21c92155e
+--- a/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
++++ b/cuda_omp_pareval_workdir_full/data/src/XSBench-omp/optimization_plan.md
+@@ -1,17 +1,18 @@
+ # Performance Analysis - CUDA to OMP Migration
+ 
+ ## Current Metrics
+-- Runtime: 0.464 seconds (event-based baseline run, single warmup + timed iteration)
+-- Main kernel: `xs_lookup_kernel_baseline`, GPU utilization info unavailable for OpenMP target, 2 kernel launches (1 warmup + 1 timed)
+-- Memory transfer: ~167 ms (~36% of runtime) for the 241 MiB dataset (host→device 166.6 ms, device→host 0.60 ms)
+-- Kernel launches: 2
++- Runtime: 0.400 seconds (event-based baseline run, single warmup + timed iteration)
++- Main kernel: `xs_lookup_kernel_baseline`, OpenMP target lacks fine-grain GPU metrics but still exhibits 2 kernel launches (1 warmup + 1 timed).
++- Memory transfer: host→device 139.3 ms (~34.8% of runtime) to stream the 241 MiB dataset; device→host 0.55 ms.
++- Kernel launches: 2.
++- Target GPU: NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace, compute capability ~8.6) as reported in `system_info.txt`; `-gpu=cc86` is used to match the device while compiled through NVC++.
+ 
+ ## Bottleneck Hypothesis (pick 1–2)
+-- [x] Transfers too high (host→device dominates the first quarter of runtime)
+-- [ ] Too many kernels / target regions
+-- [ ] Missing collapse vs CUDA grid dimensionality
+-- [x] Hot kernel needs micro-opts (baseline compute phase is still ~149 ms)
++- [x] Transfers too high (host→device still consumes more than a third of the wall time even though the allocations only happen once per simulation run).
++- [ ] Too many kernels / target regions.
++- [ ] Missing collapse vs CUDA grid dimensionality.
++- [x] Hot kernel needs micro-opts (kernel time is ~129 ms and dominates the remaining runtime after transfers).
+ 
+ ## Actions (1–3 max)
+-1. `const` aliasing hints: mark all read-only SimulationData pointers and helper signatures as `const __restrict__` so the compiler sees the kernels as pure loads and can hoist/reuse values; this micro-optimization tightens the hot loops and should recover a few percent of the baseline OpenMP kernel time.
+-2. Transfer overlap or persistence: analyze whether the 241 MiB of data can stay resident longer (e.g., persistent allocation + asynchronous `omp_target_memcpy` or overlapped startup work) to shave the current ~167 ms spent on transfers and target initialization (~10% win).
++1. `Cache per-material pointers & pass nuclide grid bases`: computing `mats_row`, `concs_row`, and a dedicated `nuclide_grid_base` per `p_nuc` removes repeated `mat*max_num_nucs` and `p_nuc*n_gridpoints` arithmetic inside `calculate_macro_xs`/`calculate_micro_xs`, which lowers the index-multiply pressure seen by the Ada (cc86) shader cores and frees register pressure for the hot inner loop; expected to reclaim a few percent of kernel time while leaving the data movement strategy untouched.
++2. `Re-assess transfer persistency if needed`: if host→device time remains stubbornly high in future runs (and dominates >30% of total), explore keeping the 241 MiB data in long-lived `omp_target_alloc` buffers or overlapping the memcpy with other work; this keeps compliance with the current data strategy but targets the ~139 ms transfer window.
+
+tokens used
+160,967

@@ -1,0 +1,3 @@
+SRC_DIR=$(BENCH_DIR)/src
+SRC_OBJS=$(SRC_DIR)/needle.cpp
+INPUT_FLAGS=2048 10 2 

@@ -1,0 +1,324 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <omp.h>
+
+#include "gate.h"
+#include "utils.h"
+
+static inline bool compare_host_segment(const DATA_TYPE* reference,
+                                        const DATA_TYPE* candidate,
+                                        size_t start_index,
+                                        size_t count) {
+  for (size_t idx = 0; idx < count; ++idx) {
+    const size_t pos = start_index + idx;
+    if (percentDiff(reference[pos], candidate[pos]) >
+        PERCENT_DIFF_ERROR_THRESHOLD) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int main(int argc, char* argv[]) {
+  double start = rtclock();
+
+  DATA_TYPE* A =
+      static_cast<DATA_TYPE*>(malloc(MAP_SIZE * MAP_SIZE * sizeof(DATA_TYPE)));
+  DATA_TYPE* B_host = static_cast<DATA_TYPE*>(
+      malloc((MAP_SIZE - 2) * (MAP_SIZE - 2) * sizeof(DATA_TYPE)));
+  DATA_TYPE* B = static_cast<DATA_TYPE*>(
+      malloc((MAP_SIZE - 2) * (MAP_SIZE - 2) * sizeof(DATA_TYPE)));
+  DATA_TYPE* C = static_cast<DATA_TYPE*>(malloc(4 * 4 * sizeof(DATA_TYPE)));
+  DATA_TYPE* random_values =
+      static_cast<DATA_TYPE*>(malloc(MAP_SIZE * MAP_SIZE * sizeof(DATA_TYPE)));
+
+  const size_t input_elems =
+      static_cast<size_t>(MAP_SIZE) * static_cast<size_t>(MAP_SIZE);
+  const size_t output_elems = static_cast<size_t>(MAP_SIZE - 2) *
+                              static_cast<size_t>(MAP_SIZE - 2);
+  const size_t filter_elems = 4 * 4;
+
+  for (int i = 0; i < MAP_SIZE; ++i) {
+    for (int j = 0; j < MAP_SIZE; ++j) {
+      const DATA_TYPE value = rand() / static_cast<float>(RAND_MAX);
+      random_values[i * MAP_SIZE + j] = value;
+      A[i * MAP_SIZE + j] = value;
+    }
+  }
+
+  WinogradConv2D_2x2_filter_transformation(C);
+
+  const int out_map_size = MAP_SIZE - 2;
+  const int tile_n = (out_map_size + 1) / 2;
+
+  size_t globalWorkSize[2] = {
+      static_cast<size_t>(
+          ceil(static_cast<float>(tile_n) /
+               static_cast<float>(DIM_LOCAL_WORK_GROUP_X))) *
+          DIM_LOCAL_WORK_GROUP_X,
+      static_cast<size_t>(
+          ceil(static_cast<float>(tile_n) /
+               static_cast<float>(DIM_LOCAL_WORK_GROUP_Y))) *
+          DIM_LOCAL_WORK_GROUP_Y};
+
+  size_t localWorkSize[2] = {DIM_LOCAL_WORK_GROUP_X, DIM_LOCAL_WORK_GROUP_Y};
+
+  size_t cpu_global_size[2];
+  size_t gpu_global_size[2];
+  size_t global_offset[2];
+
+  bool pass = true;
+
+  double co_time = 0.0;
+
+  // Precompute the golden output once to reuse during validation.
+  WinogradConv2D_2x2(A, B_host, C);
+
+  const int device_count = omp_get_num_devices();
+  const bool has_device = device_count > 0;
+
+  if (has_device) {
+    // Keep the repeatedly used inputs resident on the GPU and reuse the output
+    // buffer without remapping each launch.
+#pragma omp target data map(to: A[0:input_elems], C[0:filter_elems], \
+                                B_host[0:output_elems]) \
+    map(alloc: B[0:output_elems])
+    {
+      for (int cpu_offset = 0; cpu_offset <= 100; cpu_offset++) {
+        cpu_global_size[0] =
+            cpu_offset *
+            static_cast<size_t>(
+                ceil(static_cast<float>(tile_n) /
+                     static_cast<float>(DIM_LOCAL_WORK_GROUP_X))) /
+            100 * DIM_LOCAL_WORK_GROUP_X;
+        cpu_global_size[1] = globalWorkSize[1];
+
+        gpu_global_size[0] = globalWorkSize[0] - cpu_global_size[0];
+        gpu_global_size[1] = globalWorkSize[1];
+
+        global_offset[0] = cpu_global_size[0];
+        global_offset[1] = 0;
+
+        const int tile_i_size = gpu_global_size[0];
+        const int tile_j_size = gpu_global_size[1];
+        const int offset_i = global_offset[0];
+        const int offset_j = global_offset[1];
+
+        const bool cpu_run = cpu_global_size[0] > 0;
+        const bool gpu_run = gpu_global_size[0] > 0;
+
+        const int cpu_rows_candidate =
+            2 * static_cast<int>(cpu_global_size[0]);
+        const int cpu_rows =
+            (cpu_rows_candidate < out_map_size) ? cpu_rows_candidate
+                                                : out_map_size;
+        const int gpu_rows = out_map_size - cpu_rows;
+        const size_t gpu_row_offset =
+            static_cast<size_t>(cpu_rows) * static_cast<size_t>(out_map_size);
+        const size_t device_gpu_elems_sz =
+            static_cast<size_t>(gpu_rows) * static_cast<size_t>(out_map_size);
+
+        double co_start = rtclock();
+
+        if (gpu_run) {
+          // Execute Winograd tiles assigned to the GPU; data is already present.
+#pragma omp target teams distribute parallel for collapse(2) \
+        map(present: A[0:input_elems], C[0:filter_elems], \
+                     B[0:output_elems]) \
+        firstprivate(tile_i_size, tile_j_size, offset_i, offset_j)
+          for (int tile_j = 0; tile_j < tile_j_size; tile_j++) {
+            for (int tile_i = 0; tile_i < tile_i_size; tile_i++) {
+              DATA_TYPE input_tile[4][4];
+              DATA_TYPE tmp_tile[4][4];
+              DATA_TYPE transformed_tile[4][4];
+              for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 4; j++) {
+                  int x = 2 * (tile_i + offset_i) + i;
+                  int y = 2 * (tile_j + offset_j) + j;
+                  if (x >= MAP_SIZE || y >= MAP_SIZE) {
+                    input_tile[i][j] = 0;
+                    continue;
+                  }
+                  input_tile[i][j] = A[x * MAP_SIZE + y];
+                }
+              }
+
+              for (int j = 0; j < 4; j++) {
+                tmp_tile[0][j] = input_tile[0][j] - input_tile[2][j];
+                tmp_tile[1][j] = input_tile[1][j] + input_tile[2][j];
+                tmp_tile[2][j] = -input_tile[1][j] + input_tile[2][j];
+                tmp_tile[3][j] = input_tile[1][j] - input_tile[3][j];
+              }
+
+              for (int i = 0; i < 4; i++) {
+                transformed_tile[i][0] = tmp_tile[i][0] - tmp_tile[i][2];
+                transformed_tile[i][1] = tmp_tile[i][1] + tmp_tile[i][2];
+                transformed_tile[i][2] = -tmp_tile[i][1] + tmp_tile[i][2];
+                transformed_tile[i][3] = tmp_tile[i][1] - tmp_tile[i][3];
+              }
+
+              DATA_TYPE multiplied_tile[4][4];
+              for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 4; j++) {
+                  multiplied_tile[i][j] =
+                      transformed_tile[i][j] * C[i * 4 + j];
+                }
+              }
+
+              DATA_TYPE tmp_tile_1[2][4];
+              DATA_TYPE final_tile[2][2];
+
+              for (int j = 0; j < 4; j++) {
+                tmp_tile_1[0][j] = multiplied_tile[0][j] + multiplied_tile[1][j] +
+                                   multiplied_tile[2][j];
+                tmp_tile_1[1][j] = multiplied_tile[1][j] - multiplied_tile[2][j] -
+                                   multiplied_tile[3][j];
+              }
+
+              for (int i = 0; i < 2; i++) {
+                final_tile[i][0] = tmp_tile_1[i][0] + tmp_tile_1[i][1] +
+                                   tmp_tile_1[i][2];
+                final_tile[i][1] = tmp_tile_1[i][1] - tmp_tile_1[i][2] -
+                                   tmp_tile_1[i][3];
+              }
+
+              for (int i = 0; i < 2; i++) {
+                for (int j = 0; j < 2; j++) {
+                  int x = 2 * (tile_i + offset_i) + i;
+                  int y = 2 * (tile_j + offset_j) + j;
+                  if (x >= MAP_SIZE - 2 || y >= MAP_SIZE - 2) {
+                    continue;
+                  }
+                  B[x * (MAP_SIZE - 2) + y] = final_tile[i][j];
+                }
+              }
+            }
+          }
+        }
+
+        if (gpu_run && gpu_rows > 0) {
+#pragma omp target update from(B[gpu_row_offset:device_gpu_elems_sz])
+        }
+
+        if (cpu_run) {
+          WinogradConv2D_2x2_omp(A, B, C, cpu_global_size);
+        }
+
+        co_time += rtclock() - co_start;
+
+#ifdef VERBOSE
+        if (cpu_run)
+          printf("run on host\n");
+        if (gpu_run)
+          printf("run on device\n");
+        printf("CPU workload size : %d\n", cpu_offset);
+#endif
+
+        bool iteration_pass = true;
+
+        if (gpu_run && gpu_rows > 0) {
+          int mismatch_flag = 0;
+          const int device_cols = out_map_size;
+          const int device_gpu_elems = gpu_rows * device_cols;
+          const size_t device_row_offset = gpu_row_offset;
+#pragma omp target teams distribute parallel for \
+        map(present: B[0:output_elems], B_host[0:output_elems]) \
+        map(tofrom: mismatch_flag) \
+        firstprivate(device_cols, device_gpu_elems, device_row_offset)
+          for (int elem = 0; elem < device_gpu_elems; ++elem) {
+            const int row = elem / device_cols;
+            const int col = elem - row * device_cols;
+            const size_t idx =
+                device_row_offset +
+                static_cast<size_t>(row) * static_cast<size_t>(device_cols) +
+                static_cast<size_t>(col);
+            const DATA_TYPE gpu_val = B[idx];
+            const DATA_TYPE ref_val = B_host[idx];
+            DATA_TYPE percent = 0.0f;
+            const DATA_TYPE abs_gpu = (gpu_val < static_cast<DATA_TYPE>(0))
+                                          ? -gpu_val
+                                          : gpu_val;
+            const DATA_TYPE abs_ref = (ref_val < static_cast<DATA_TYPE>(0))
+                                          ? -ref_val
+                                          : ref_val;
+            if (!((abs_gpu < static_cast<DATA_TYPE>(0.01f)) &&
+                  (abs_ref < static_cast<DATA_TYPE>(0.01f)))) {
+              DATA_TYPE numerator = gpu_val - ref_val;
+              if (numerator < static_cast<DATA_TYPE>(0)) {
+                numerator = -numerator;
+              }
+              DATA_TYPE denominator =
+                  gpu_val + static_cast<DATA_TYPE>(SMALL_FLOAT_VAL);
+              if (denominator < static_cast<DATA_TYPE>(0)) {
+                denominator = -denominator;
+              }
+              percent = static_cast<DATA_TYPE>(100.0f) *
+                        (numerator / denominator);
+              if (percent < static_cast<DATA_TYPE>(0)) {
+                percent = -percent;
+              }
+            }
+            if (percent > PERCENT_DIFF_ERROR_THRESHOLD) {
+#pragma omp atomic write
+              mismatch_flag = 1;
+            }
+          }
+          if (mismatch_flag != 0) {
+            iteration_pass = false;
+          }
+        }
+
+        if (cpu_run && cpu_rows > 0) {
+          const size_t cpu_elem_count =
+              static_cast<size_t>(cpu_rows) * static_cast<size_t>(out_map_size);
+          if (!compare_host_segment(B_host, B, 0, cpu_elem_count)) {
+            iteration_pass = false;
+          }
+        }
+
+        pass &= iteration_pass;
+      }
+    }
+  } else {
+    for (int cpu_offset = 0; cpu_offset <= 100; cpu_offset++) {
+      cpu_global_size[0] = globalWorkSize[0];
+      cpu_global_size[1] = globalWorkSize[1];
+      gpu_global_size[0] = 0;
+      gpu_global_size[1] = 0;
+
+      double co_start = rtclock();
+
+      WinogradConv2D_2x2_omp(A, B, C, cpu_global_size);
+
+      co_time += rtclock() - co_start;
+
+#ifdef VERBOSE
+      printf("run on host\n");
+      printf("CPU workload size : %d\n", cpu_offset);
+#endif
+
+      pass &= compareResults(B_host, B);
+    }
+  }
+
+  printf("%s\n", pass ? "PASS" : "FAIL");
+
+  GATE_STATS_F32("B_host", B_host, output_elems);
+  GATE_STATS_F32("B", B, output_elems);
+
+  free(A);
+  free(B);
+  free(B_host);
+  free(C);
+  free(random_values);
+
+  double end = rtclock();
+  printf("Co-execution time: %lf s\n", co_time);
+  printf("Total time: %lf s\n", end - start);
+  printf("Ratio of co-execution time to total time: %.2lf%%\n",
+         100.0 * co_time / (end - start));
+
+  return 0;
+}
