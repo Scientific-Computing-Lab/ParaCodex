@@ -42,7 +42,11 @@ paracodex/
 │   ├── serial_omp_hecbench_workdir/             # HeCBench workspace
 │   └── cuda_omp_pareval_workdir/                # ParEval CUDA/OpenMP workspace
 ├── results/                                     # Results and performance data
-└── kill_gpu_processes.py/sh                     # GPU process management utilities
+├── setup_environment.sh                         # Main environment setup script
+├── install_nvidia_hpc_sdk.sh                    # Automated NVIDIA HPC SDK installer
+├── verify_environment.sh                        # Environment verification tool
+├── kill_gpu_processes.py/sh                     # GPU process management utilities
+└── requirements.txt                             # Python dependencies
 ```
 
 ## ✨ Key Features
@@ -78,39 +82,218 @@ paracodex/
 
 ### 📋 Prerequisites
 
+#### Core Requirements
+- **Node.js 22+** and **npm**: For Codex CLI
+- **Python 3.8+**: For the pipeline scripts
+- **OpenAI Codex CLI**: For AI agent interactions (`npm install -g @openai/codex`)
+- **OpenAI API Key**: Set as `OPENAI_API_KEY` environment variable
+
+#### Compilation and GPU Tools
 - **NVIDIA HPC SDK**: For OpenMP GPU offloading (nvc++ compiler)
 - **CUDA Toolkit**: For CUDA development
-- **Python 3.8+**: For the pipeline scripts
-- **Codex CLI**: For AI agent interactions
-- **NVIDIA Nsight Compute**: For GPU profiling
+- **NVIDIA Nsight Systems (nsys)**: For GPU profiling
+- **NVIDIA GPU**: With OpenMP offloading support
 
 ### ⚙️ Installation
 
-1. **Clone the repository**:
+#### Quick Setup (Automated)
+
+We provide automated setup scripts to streamline the installation process:
+
+```bash
+# Clone the repository
+git clone <repository-url>
+cd paracodex
+
+# Make scripts executable
+chmod +x setup_environment.sh install_nvidia_hpc_sdk.sh verify_environment.sh
+
+# Step 1: Install NVIDIA HPC SDK (if not already installed)
+sudo ./install_nvidia_hpc_sdk.sh
+
+# Step 2: Run the main environment setup
+./setup_environment.sh
+
+# Step 3: Verify your installation
+./verify_environment.sh
+```
+
+#### 🔧 Setup Scripts Overview
+
+**1. `install_nvidia_hpc_sdk.sh`** - NVIDIA HPC SDK Automated Installer
+   
+   This script automates the download and installation of NVIDIA HPC SDK v25.7:
+   - ✅ Downloads NVIDIA HPC SDK (~3GB)
+   - ✅ Verifies system requirements (10GB disk space, x86_64 architecture)
+   - ✅ Installs compilers (nvc++, nvfortran) with OpenMP GPU offload support
+   - ✅ Configures PATH and environment variables in `~/.bashrc`
+   - ✅ Tests OpenMP CPU and GPU offload support
+   - ⚠️ Requires sudo privileges
+   
    ```bash
-   git clone <repository-url>
-   cd paracodex
+   sudo ./install_nvidia_hpc_sdk.sh
+   source ~/.bashrc  # Activate the new environment
    ```
 
-2. **Set up the working directory**:
+**2. `setup_environment.sh`** - Main Environment Setup Script
+   
+   Checks and installs all ParaCodex dependencies:
+   - ✅ Check for Node.js v22+ and npm
+   - ✅ Install Codex CLI (`@openai/codex`) if missing
+   - ✅ Verify Python 3.8+ installation
+   - ✅ Install Python dependencies from `requirements.txt`
+   - ✅ Check for NVIDIA HPC SDK (nvc++)
+   - ✅ Check for Nsight Systems (nsys)
+   - ✅ Verify GPU accessibility
+   - ✅ Confirm OpenAI API key is set
+   - 📊 Provides summary of missing dependencies
+   
    ```bash
-   # The workdirs contain benchmark-specific source code and configurations
-   # For Rodinia benchmarks, use workdirs/serial_omp_rodinia_workdir/
-   # Ensure proper directory structure:
-   #   - data/src/ containing parallel kernel directories (e.g., nw-omp, lud-omp)
-   #   - golden_labels/src/ containing serial reference implementations
-   #   - serial_kernels_changedVars/src/ containing transformed serial kernels (optional)
-   # Ensure jsonl file with kernel names present in pipeline/combined_*_filenames.jsonl
-   # Ensure `golden_labels/src` exists if you want to run the supervisor agent
+   ./setup_environment.sh
    ```
 
-3. **Install dependencies**:
+**3. `verify_environment.sh`** - Environment Verification Tool
+   
+   Comprehensive check of your ParaCodex environment:
+   - ✅ Verifies all required tools are installed and accessible
+   - ✅ Shows version information for each component
+   - ✅ Tests OpenMP support
+   - ✅ Checks GPU accessibility with detailed info
+   - ✅ Validates Python package installations
+   - 📊 Provides a summary of any missing dependencies
+   
    ```bash
-   # Ensure NVIDIA HPC SDK is installed and nvc++ is in PATH
-   # Install Python dependencies (if any requirements.txt exists)
+   ./verify_environment.sh
    ```
+
+#### Manual Setup
+
+If you prefer manual installation or need to install specific components:
+
+##### 1. Install NVIDIA HPC SDK
+
+**Option A: Automated (Recommended)**
+```bash
+sudo ./install_nvidia_hpc_sdk.sh
+source ~/.bashrc
+```
+
+**Option B: Manual**
+- Download from: https://developer.nvidia.com/hpc-sdk
+- Install version 25.7 for CUDA 12.6 support
+- Add to PATH:
+  ```bash
+  export PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/bin:$PATH
+  export LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/lib:$LD_LIBRARY_PATH
+  export MANPATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/man:$MANPATH
+  ```
+- Add to `~/.bashrc` for persistence
+
+##### 2. Install Node.js and npm
+
+```bash
+# Using nvm (recommended)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+source ~/.bashrc
+nvm install 22
+
+# Or using apt
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+```
+
+##### 3. Install Codex CLI
+
+```bash
+npm install -g @openai/codex
+```
+
+##### 4. Set OpenAI API Key
+
+```bash
+export OPENAI_API_KEY='your-api-key-here'
+# Add to ~/.bashrc for persistence
+echo "export OPENAI_API_KEY='your-api-key-here'" >> ~/.bashrc
+```
+
+##### 5. Install Python dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+##### 6. Install NVIDIA Nsight Systems
+
+- Download from: https://developer.nvidia.com/nsight-systems
+- Or use package manager if available
+
+#### Verify Installation
+
+After setup, verify your environment is correctly configured:
+
+```bash
+./verify_environment.sh
+```
+
+This will check and display:
+- ✅ Node.js and npm versions
+- ✅ Codex CLI installation
+- ✅ Python version and key packages (openai, numpy, torch, matplotlib)
+- ✅ NVIDIA HPC SDK (nvc++) version
+- ✅ Nsight Systems (nsys) installation
+- ✅ CUDA toolkit (optional)
+- ✅ GPU information (name, driver, memory)
+- ✅ OpenMP support
+- ✅ OpenAI API key configuration
+
+**Expected output for a properly configured system:**
+```
+✅ All core dependencies are installed and configured
+```
+
+**If you see missing dependencies:**
+```
+❌ X core dependencies are missing
+   Run './setup_environment.sh' or see installation instructions
+```
+
+Manual verification commands:
+```bash
+codex --version
+python3 --version
+nvc++ --version
+nsys --version
+nvidia-smi
+echo $OPENAI_API_KEY
+```
+
+#### Python Dependencies
+
+Key Python packages (see `requirements.txt` for full list):
+- `openai>=2.8.1` - OpenAI API client
+- `pandas>=2.3.3` - Data processing
+- `numpy>=2.1.2` - Numerical computing
+- `matplotlib>=3.10.6` - Visualization
+- `seaborn>=0.13.2` - Statistical visualization
+- `tqdm>=4.67.1` - Progress bars
+- NVIDIA CUDA libraries for GPU support
 
 ### 💻 Basic Usage
+
+#### Initial Setup
+
+After installation, ensure your working directory is properly configured:
+
+```bash
+# The workdirs contain benchmark-specific source code and configurations
+# For Rodinia benchmarks, use workdirs/serial_omp_rodinia_workdir/
+# Ensure proper directory structure:
+#   - data/src/ containing parallel kernel directories (e.g., nw-omp, lud-omp)
+#   - golden_labels/src/ containing serial reference implementations
+#   - serial_kernels_changedVars/src/ containing transformed serial kernels (optional)
+# Ensure jsonl file with kernel names present in pipeline/combined_*_filenames.jsonl
+# Ensure `golden_labels/src` exists if you want to run the supervisor agent
+```
 
 #### 🔄 1. Initial Translation
 
@@ -264,6 +447,86 @@ For HeCBench benchmarks, use `workdirs/serial_omp_hecbench_workdir/` as the work
 #### ParEval Benchmarks
 For ParEval CUDA/OpenMP translation, use `workdirs/cuda_omp_pareval_workdir/` as the working directory.
 
+## 🛠️ Utility Scripts
+
+ParaCodex includes several utility scripts to simplify environment management and troubleshooting:
+
+### Setup and Verification Scripts
+
+#### `setup_environment.sh`
+Main environment setup and dependency checker. Checks for all required tools and installs missing Python dependencies.
+
+**Usage:**
+```bash
+./setup_environment.sh
+```
+
+**What it does:**
+- Checks Node.js, npm, and Codex CLI
+- Installs Codex CLI if npm is available
+- Verifies Python and pip
+- Installs Python packages from `requirements.txt`
+- Checks NVIDIA HPC SDK, Nsight Systems, and GPU
+- Validates OpenAI API key
+- Provides summary of missing dependencies
+
+#### `install_nvidia_hpc_sdk.sh`
+Automated installer for NVIDIA HPC SDK v25.7 with OpenMP GPU offload support.
+
+**Usage:**
+```bash
+sudo ./install_nvidia_hpc_sdk.sh
+source ~/.bashrc
+```
+
+**Features:**
+- Downloads NVIDIA HPC SDK v25.7 (~3GB)
+- Checks system requirements (10GB disk, x86_64 arch)
+- Installs to `/opt/nvidia/hpc_sdk`
+- Configures environment variables automatically
+- Tests OpenMP CPU and GPU offload support
+- Colorful progress indicators
+
+**Requirements:** sudo access, 10GB free disk space
+
+#### `verify_environment.sh`
+Comprehensive environment verification tool that checks all dependencies and displays detailed version information.
+
+**Usage:**
+```bash
+./verify_environment.sh
+```
+
+**Checks:**
+- Node.js, npm, Codex CLI versions
+- Python version and key packages
+- NVIDIA HPC SDK (nvc++) and OpenMP support
+- Nsight Systems and CUDA toolkit
+- GPU info (name, driver, memory)
+- OpenAI API key configuration
+
+### GPU Management Scripts
+
+#### `kill_gpu_processes.sh` / `kill_gpu_processes.py`
+Utilities to terminate GPU processes when needed (e.g., clearing hung processes during development).
+
+**Usage:**
+```bash
+./kill_gpu_processes.sh
+# or
+python3 kill_gpu_processes.py
+```
+
+### Cleanup Utilities
+
+#### `utils/clean_kernel_dirs.py`
+Cleans up generated files in kernel directories during development.
+
+**Usage:**
+```bash
+python3 utils/clean_kernel_dirs.py --help
+```
+
 
 
 ## 🆘 Support
@@ -273,6 +536,69 @@ For questions and support:
 - Check the prompts documentation:
   - `pipeline/SERIAL_OMP_PROMPTS.md` for serial-to-OpenMP translation
   - `pipeline/CUDA_PROMPTS.md` for CUDA-related translations
+
+### Troubleshooting
+
+#### Environment Issues
+
+**Using the automated scripts:**
+
+If `setup_environment.sh` reports missing dependencies, install them as indicated. Common issues:
+
+1. **NVIDIA HPC SDK not found**: 
+   ```bash
+   sudo ./install_nvidia_hpc_sdk.sh
+   source ~/.bashrc
+   ```
+   
+   If installation fails:
+   - Check disk space (need 10GB+)
+   - Verify you have sudo privileges
+   - Check internet connection (downloads ~3GB)
+   - Manually download from https://developer.nvidia.com/hpc-sdk
+
+2. **Codex CLI not found**: 
+   ```bash
+   npm install -g @openai/codex
+   ```
+   If this fails, ensure Node.js and npm are installed first.
+
+3. **OpenAI API Key not set**:
+   ```bash
+   export OPENAI_API_KEY='your-api-key'
+   echo "export OPENAI_API_KEY='your-api-key'" >> ~/.bashrc
+   source ~/.bashrc
+   ```
+
+4. **GPU not accessible**:
+   - Check with `nvidia-smi`
+   - Install NVIDIA drivers if needed: `sudo apt install nvidia-driver-XXX`
+   - Verify CUDA compatibility
+   - Reboot after driver installation
+
+5. **nvc++ installed but not in PATH**:
+   ```bash
+   export PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/bin:$PATH
+   export LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/lib:$LD_LIBRARY_PATH
+   echo 'export PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/bin:$PATH' >> ~/.bashrc
+   source ~/.bashrc
+   ```
+
+6. **Python package installation fails**:
+   ```bash
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+   If specific packages fail, install them individually:
+   ```bash
+   pip install openai pandas numpy matplotlib seaborn tqdm
+   ```
+
+#### Common Runtime Issues
+
+- **Compilation errors**: Ensure NVIDIA HPC SDK is properly installed and in PATH
+- **Permission denied on scripts**: Run `chmod +x setup_environment.sh`
+- **Python import errors**: Run `pip install -r requirements.txt`
 
 ---
 
