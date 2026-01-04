@@ -1,13 +1,13 @@
 # ParaCodex Quick Start Guide
 
-This is a condensed guide to get you up and running quickly. For detailed information, see [ENVIRONMENT.md](ENVIRONMENT.md) and [README.md](README.md).
+This is a condensed guide to get you up and running quickly. For detailed information, see [README.md](README.md).
 
 ## 🎯 Prerequisites Checklist
 
 Before running ParaCodex, ensure you have:
 
 - [ ] NVIDIA GPU with CUDA support
-- [ ] Node.js 18+ and npm 9+ installed
+- [ ] Node.js 22+ and npm 9+ installed
 - [ ] Codex CLI installed (`npm install -g @openai/codex`)
 - [ ] NVIDIA HPC SDK 25.7+ installed (`nvc++` compiler)
 - [ ] NVIDIA Nsight Systems 2025.3+ installed (`nsys` profiler)
@@ -33,10 +33,8 @@ If you see ❌ errors, you can auto-install missing dependencies:
 # Auto-install NVIDIA HPC SDK (if missing)
 sudo ./install_nvidia_hpc_sdk.sh
 
-# Note: Nsight Systems is bundled with HPC SDK - no separate install needed!
-# (Only run install_nsight_systems.sh if you don't have HPC SDK)
-
-# Or see ENVIRONMENT.md for manual installation
+# Note: Nsight Systems (nsys) is bundled with HPC SDK - no separate install needed!
+# If nsys is not found after HPC SDK installation, ensure HPC SDK is in your PATH.
 ```
 
 ### 3. Install Node.js Dependencies
@@ -53,7 +51,21 @@ codex --version
 pip install -r requirements.txt
 ```
 
-### 5. Set API Key
+### 5. Set Up OpenAI API Access
+
+**Option 1: Login with OpenAI Pro Account (Recommended)**
+```bash
+# Interactive login (opens browser)
+codex login
+
+# Or login with API key
+echo $OPENAI_API_KEY | codex login --with-api-key
+
+# Verify login
+codex login status
+```
+
+**Option 2: Use API Key Environment Variable**
 ```bash
 export OPENAI_API_KEY="your-api-key-here"
 ```
@@ -149,7 +161,7 @@ If you have Docker and NVIDIA Container Toolkit:
 ```bash
 # Clone
 git clone https://github.com/Scientific-Computing-Lab/ParaCodex.git
-cd codex_baseline
+cd paracodex
 
 # Set API key
 export OPENAI_API_KEY="your-api-key-here"
@@ -194,10 +206,17 @@ export LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/lib:$LD_L
 ### Issue: `nsys: command not found`
 **Solution**: Install NVIDIA Nsight Systems from [NVIDIA website](https://developer.nvidia.com/nsight-systems).
 
-### Issue: `OPENAI_API_KEY not set`
-**Solution**: Export your API key:
+### Issue: `OPENAI_API_KEY not set` or Codex authentication failed
+**Solution**: 
 ```bash
+# Option 1: Login with OpenAI Pro account (recommended)
+codex login
+
+# Option 2: Set API key environment variable
 export OPENAI_API_KEY="your-api-key-here"
+
+# Verify authentication
+codex login status
 ```
 
 ### Issue: GPU not accessible
@@ -209,15 +228,14 @@ nvidia-smi
 
 ## 📚 Next Steps
 
-- Read [README.md](README.md) for detailed usage examples
-- Read [ENVIRONMENT.md](ENVIRONMENT.md) for complete setup instructions
-- Check `pipeline/prompts.md` for AI prompt documentation
+- Read [README.md](README.md) for detailed usage examples and setup instructions
+- Check `pipeline/prompts.md` for AI prompt documentation (if available)
 - Explore example results in the `results/` directory
 
 ## 🆘 Getting Help
 
 - Run `./verify_environment.sh` to diagnose setup issues
-- Check [ENVIRONMENT.md](ENVIRONMENT.md) for troubleshooting
+- Check [README.md](README.md) for troubleshooting
 - Open an issue on GitHub for support
 
 ---

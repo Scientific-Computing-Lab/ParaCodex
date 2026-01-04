@@ -83,8 +83,24 @@ fi
 echo ""
 echo "Installing Python dependencies from requirements.txt..."
 if [ -f "requirements.txt" ]; then
-    pip install -r requirements.txt
-    echo "✅ Python dependencies installed"
+    # Use pip3 if available, otherwise use pip
+    PIP_CMD=""
+    if command_exists pip3; then
+        PIP_CMD="pip3"
+    elif command_exists pip; then
+        PIP_CMD="pip"
+    else
+        echo "❌ Neither pip nor pip3 found. Please install pip first."
+        PIP_CMD=""
+    fi
+    
+    if [ -n "$PIP_CMD" ]; then
+        if $PIP_CMD install -r requirements.txt; then
+            echo "✅ Python dependencies installed"
+        else
+            echo "⚠️  Some Python dependencies may have failed to install"
+        fi
+    fi
 else
     echo "⚠️  requirements.txt not found in current directory"
 fi
@@ -97,9 +113,11 @@ if command_exists nvc++; then
     echo "✅ NVIDIA HPC SDK found: $NVC_VERSION"
 else
     echo "❌ NVIDIA HPC SDK (nvc++) not found"
-    echo "   Please install from: https://developer.nvidia.com/hpc-sdk"
+    echo "   To install automatically, run:"
+    echo "     sudo ./install_nvidia_hpc_sdk.sh"
+    echo "   Or install manually from: https://developer.nvidia.com/hpc-sdk"
     echo "   After installation, add to PATH:"
-    echo "   export PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/bin:\$PATH"
+    echo "     export PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/bin:\$PATH"
 fi
 
 # Check Nsight Systems
@@ -110,7 +128,10 @@ if command_exists nsys; then
     echo "✅ Nsight Systems found: $NSYS_VERSION"
 else
     echo "❌ Nsight Systems (nsys) not found"
-    echo "   Please install from: https://developer.nvidia.com/nsight-systems"
+    echo "   Note: Nsight Systems is bundled with NVIDIA HPC SDK."
+    echo "   If you have HPC SDK installed, ensure it's in your PATH."
+    echo "   Otherwise, install HPC SDK: sudo ./install_nvidia_hpc_sdk.sh"
+    echo "   Or install separately from: https://developer.nvidia.com/nsight-systems"
 fi
 
 # Check GPU
@@ -123,13 +144,26 @@ else
     echo "❌ nvidia-smi not found. GPU may not be accessible."
 fi
 
-# Check OpenAI API Key
+# Check OpenAI API Key / Codex Login
 echo ""
-echo "Checking OpenAI API Key..."
+echo "Checking OpenAI API Access..."
 if [ -z "$OPENAI_API_KEY" ]; then
-    echo "⚠️  OPENAI_API_KEY environment variable not set"
-    echo "   Set it with: export OPENAI_API_KEY='your-api-key'"
-    echo "   Add to ~/.bashrc for persistence"
+    # Check if codex is logged in
+    if command_exists codex; then
+        CODEX_LOGIN_STATUS=$(codex login status 2>&1)
+        if echo "$CODEX_LOGIN_STATUS" | grep -qi "logged in\|authenticated"; then
+            echo "✅ Codex CLI is logged in"
+        else
+            echo "⚠️  OPENAI_API_KEY not set and Codex not logged in"
+            echo "   Option 1 (Pro Users): Login with: codex login"
+            echo "   Option 2: Set API key: export OPENAI_API_KEY='your-api-key'"
+            echo "   Add to ~/.bashrc for persistence"
+        fi
+    else
+        echo "⚠️  OPENAI_API_KEY not set"
+        echo "   Set it with: export OPENAI_API_KEY='your-api-key'"
+        echo "   Or login with Codex: codex login (for Pro users)"
+    fi
 else
     echo "✅ OPENAI_API_KEY is set"
 fi

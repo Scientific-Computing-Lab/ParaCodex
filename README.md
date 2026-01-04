@@ -86,7 +86,9 @@ paracodex/
 - **Node.js 22+** and **npm**: For Codex CLI
 - **Python 3.8+**: For the pipeline scripts
 - **OpenAI Codex CLI**: For AI agent interactions (`npm install -g @openai/codex`)
-- **OpenAI API Key**: Set as `OPENAI_API_KEY` environment variable
+- **OpenAI API Access**: 
+  - **Pro/Plus Users**: Login directly with `codex login` (recommended)
+  - **API Key Users**: Set `OPENAI_API_KEY` environment variable
 
 #### Compilation and GPU Tools
 - **NVIDIA HPC SDK**: For OpenMP GPU offloading (nvc++ compiler)
@@ -208,8 +210,21 @@ sudo apt-get install -y nodejs
 npm install -g @openai/codex
 ```
 
-##### 4. Set OpenAI API Key
+##### 4. Set Up OpenAI API Access
 
+**Option 1: Login with OpenAI Pro Account (Recommended)**
+```bash
+# Interactive login (opens browser for authentication)
+codex login
+
+# Or login with API key from environment
+echo $OPENAI_API_KEY | codex login --with-api-key
+
+# Verify login status
+codex login status
+```
+
+**Option 2: Use API Key Environment Variable**
 ```bash
 export OPENAI_API_KEY='your-api-key-here'
 # Add to ~/.bashrc for persistence
