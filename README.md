@@ -334,8 +334,8 @@ python pipeline/initial_translation_codex.py \
 ```
 
 This will create `initial_supervised_*` files in the output directory, including:
-- `initial_supervised_ncu_output.txt` - Full nsys profiling output
-- `initial_supervised_ncu_relevant.txt` - Extracted GPU performance metrics
+- `initial_supervised_nsys_output.txt` - Full nsys profiling output
+- `initial_supervised_nsys_relevant.txt` - Extracted GPU performance metrics
 - `initial_supervised_compilation.txt` - Compilation logs
 - `initial_supervised_output.txt` - Execution output
 
@@ -369,8 +369,8 @@ pipeline/rodinia_outputs/
 │   ├── {file}_initial.c                       # Initial translated code (root level)
 │   ├── initial/                               # Initial translation directory
 │   │   └── {file}.c                           # Initial translated code
-│   ├── initial_supervised_ncu_output.txt       # Full nsys profiling output (if --supervise)
-│   ├── initial_supervised_ncu_relevant.txt    # Extracted GPU metrics (if --supervise)
+│   ├── initial_supervised_nsys_output.txt       # Full nsys profiling output (if --supervise)
+│   ├── initial_supervised_nsys_relevant.txt    # Extracted GPU metrics (if --supervise)
 │   ├── initial_supervised_compilation.txt     # Compilation logs (if --supervise)
 │   ├── initial_supervised_output.txt          # Execution output (if --supervise)
 │   ├── initial_correct/                       # After supervisor correction
@@ -401,7 +401,7 @@ pipeline/rodinia_outputs/
 **Key Artifacts Explained:**
 - **Source Code Snapshots**: Versioned code at each optimization stage (in `initial/`, `step1/`, `step2/`, `optimized/` directories)
 - **Transcripts**: AI agent conversations and decision logs (`initial_transcript.txt`, `step*/transcript.txt`)
-- **Nsys Outputs**: GPU profiling data (`step*/nsys_output.txt`, `initial_supervised_ncu_output.txt`) and extracted metrics (`step*/nsys_relevant.txt`, `initial_supervised_ncu_relevant.txt`)
+- **Nsys Outputs**: GPU profiling data (`step*/nsys_output.txt`, `initial_supervised_nsys_output.txt`) and extracted metrics (`step*/nsys_relevant.txt`, `initial_supervised_nsys_relevant.txt`)
 - **Supervised Files**: Correctness-verified code and performance metrics from supervision phase
 
 #### 📊 5. Running performance test (against golden label parallel code)
@@ -436,7 +436,7 @@ For Rodinia benchmarks, the typical workflow is:
 3. **Run translation**: Use `initial_translation_codex.py` with `--codex-workdir` pointing to `workdirs/serial_omp_rodinia_workdir/`
 4. **Verify correctness**: Use `--supervise` flag to run GATE SDK correctness checks
 5. **Optimize performance**: Use `--optimize` flag for multi-stage GPU optimization
-6. **Review metrics**: Check `*_ncu_relevant.txt` or `*_nsys_relevant.txt` files for GPU performance metrics
+6. **Review metrics**: Check `*_nsys_relevant.txt` or `*_nsys_relevant.txt` files for GPU performance metrics
 
 #### NAS Benchmarks
 For NAS benchmarks, use `workdirs/serial_omp_nas_workdir/` as the working directory with similar workflow steps.
