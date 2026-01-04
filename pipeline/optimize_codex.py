@@ -771,7 +771,7 @@ def _build_step_prompt(
 ### 0. Backup
 Save backup of {file_listing}.
 
-### 1. Get Baseline (CLASS A/S)
+### 1. Get Baseline
 ```bash
 cd {kernel_dir}
 {clean_cmd_str}
@@ -1132,7 +1132,7 @@ for (int k = 0; k < N; ++k) {{
 **DO NOT** create large scratch arrays for small histograms - the atomic overhead is negligible compared to memory transfer costs.
 **Key:** Each thread replicates the RNG state for its sample. Type E becomes parallelizable at the OUTER level.
 
-## 5. Compile and Test (CLASS A/S)
+## 5. Compile and Test
 ```bash
 {clean_cmd_str}
 {build_cmd_str}
@@ -1147,7 +1147,7 @@ If timeout/segfault: Remove `#pragma omp loop` from Type C inner loops.
 diff baseline_output.txt gpu_output.txt
 ```
 
-## 8. Profile (CLASS B/C)
+## 8. Profile
 ```bash
 {clean_cmd_str}
 {nsys_profile_cmd} > {profile_log_path} 2>&1
@@ -1185,7 +1185,7 @@ If current runtime is within 5% of expected optimal (based on nsys kernel times)
 
 ## Workflow
 
-### 1. Verify Baseline (CLASS A/S)
+### 1. Verify Baseline
 ```bash
 cd {kernel_dir}
 {clean_cmd_str}
@@ -1398,7 +1398,7 @@ Update optimization_plan.md:
 - Fix: Remove collapse/omp loop from inner/stage/writeback loops
 - Expected gain: [X]%
 
-## Profiling (CLASS B/C)
+## Profiling
 ```bash
 {clean_cmd_str}
 {nsys_profile_cmd} > {profile_log_path} 2>&1
