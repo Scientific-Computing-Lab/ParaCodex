@@ -10,7 +10,7 @@
  *       Revision:  none
  *       Compiler:  gcc
  *
- *         Author:  Liang Wang (lw2aw), lw2aw@virginia.edu
+ *         Author:  Author Name, author@example.com
  *        Company:  CS@UVa
  *
  * =====================================================================================

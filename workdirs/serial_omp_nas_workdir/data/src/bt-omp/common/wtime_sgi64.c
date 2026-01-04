@@ -73,4 +73,4 @@ void wtime(double *time)
 
 
 
-// Code was translated using: /mnt/lbosm1/home/yonif/NPB-fornow/NPB-paper/openacc-npb-saturator-transformed-intel_migration/BT/common/intel-application-migration-tool-for-openacc-to-openmp/src/intel-application-migration-tool-for-openacc-to-openmp -overwrite-input -suppress-openacc openacc-npb-saturator-transformed-intel_migration/BT/common/wtime_sgi64.c
+// Code was translated using: /mnt/lbosm1/home/user/NPB-fornow/NPB-paper/openacc-npb-saturator-transformed-intel_migration/BT/common/intel-application-migration-tool-for-openacc-to-openmp/src/intel-application-migration-tool-for-openacc-to-openmp -overwrite-input -suppress-openacc openacc-npb-saturator-transformed-intel_migration/BT/common/wtime_sgi64.c

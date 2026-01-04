@@ -1,6 +1,6 @@
 # EP Analysis Attempt
 
-Source directory `/root/codex_baseline/cuda_omp_workdir/golden_labels/src/ep-serial/` (and file `ep.c`) is not present in this workspace, so I could not inspect any loops.
+Source directory `/path/to/workdir/cuda_omp_workdir/golden_labels/src/ep-serial/` (and file `ep.c`) is not present in this workspace, so I could not inspect any loops.
 
 Commands run:
 - `find golden_labels -name 'ep.c'` (no matches)

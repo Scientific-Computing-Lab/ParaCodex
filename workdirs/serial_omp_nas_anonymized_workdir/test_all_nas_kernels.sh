@@ -3,8 +3,8 @@
 # Script to compile and run all NAS kernels
 # Usage: ./test_all_nas_kernels.sh
 
-DATA_DIR="/root/codex_baseline/serial_omp_nas_workdir/data/src"
-GOLDEN_DIR="/root/codex_baseline/serial_omp_nas_workdir/golden_labels/src"
+DATA_DIR="/path/to/workdir/serial_omp_nas_workdir/data/src"
+GOLDEN_DIR="/path/to/workdir/serial_omp_nas_workdir/golden_labels/src"
 
 DATA_SUCCESS=()
 DATA_FAILED_COMPILE=()

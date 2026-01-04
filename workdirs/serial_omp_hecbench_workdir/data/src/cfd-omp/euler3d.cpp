@@ -2,7 +2,7 @@
   euler3d.cpp
   : parallelized code of CFD
 
-  - original code from the AIAA-2009-4001 by Andrew Corrigan, acorriga@gmu.edu
+  - original code from the AIAA-2009-4001 by Author Name, author@example.com
   - parallelization with OpenCL API has been applied by
   Jianbin Fang - j.fang@tudelft.nl
   Delft University of Technology

@@ -1,4 +1,4 @@
-//Scott Grauer-Gray (sgrauerg@gmail.com)
+//Author Name (author@example.com)
 //Functions used across hmpp codes
 
 #ifndef UTILS_H

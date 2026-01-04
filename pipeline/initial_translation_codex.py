@@ -829,8 +829,8 @@ def restart_optimization_with_supervisor(kernel_name, file_name, target_api, out
 
 def main():
     parser = argparse.ArgumentParser(description='Translate serial codes to OpenMP using Codex CLI')
-    parser.add_argument('--input', default='/root/codex_baseline/pipeline/combined_serial_filenames.jsonl', help='Input JSONL file')
-    parser.add_argument('--output-dir', default='/root/codex_baseline/pipeline/Tom_aug_kernels_nas', help='Output directory for translated codes (auto-generated if not specified)')
+    parser.add_argument('--input', default='/path/to/workdir/pipeline/combined_serial_filenames.jsonl', help='Input JSONL file')
+    parser.add_argument('--output-dir', default='/path/to/workdir/pipeline/Tom_aug_kernels_nas', help='Output directory for translated codes (auto-generated if not specified)')
     parser.add_argument('--hecbench-src', default=None, help='HeCBench source directory')
     parser.add_argument('--save-failed', action='store_true', help='Save failed translations')
     parser.add_argument('--max-codes', type=int, help='Maximum number of codes to process')
@@ -876,7 +876,7 @@ def main():
     # input JSONL, target API, and Codex workdir so we start fresh.
     # ------------------------------------------------------------------
     try:
-        clean_script = Path("/root/codex_baseline/utils/clean_kernel_dirs.py")
+        clean_script = Path("/path/to/workdir/utils/clean_kernel_dirs.py")
         if clean_script.exists():
             base_path = final_workdir / "data" / "src"
             clean_cmd = [

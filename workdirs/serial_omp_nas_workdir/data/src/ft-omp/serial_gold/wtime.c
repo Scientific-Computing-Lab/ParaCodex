@@ -15,4 +15,4 @@ void wtime(double *t)
 
     
 
-// Code was translated using: /mnt/lbosm1/home/yonif/NPB-fornow/NPB-paper/openacc-npb-saturator-transformed-intel_migration/FT/FT/intel-application-migration-tool-for-openacc-to-openmp/src/intel-application-migration-tool-for-openacc-to-openmp -overwrite-input -suppress-openacc openacc-npb-saturator-transformed-intel_migration/FT/FT/wtime.c
+// Code was translated using: /mnt/lbosm1/home/user/NPB-fornow/NPB-paper/openacc-npb-saturator-transformed-intel_migration/FT/FT/intel-application-migration-tool-for-openacc-to-openmp/src/intel-application-migration-tool-for-openacc-to-openmp -overwrite-input -suppress-openacc openacc-npb-saturator-transformed-intel_migration/FT/FT/wtime.c

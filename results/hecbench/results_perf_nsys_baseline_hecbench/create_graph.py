@@ -72,7 +72,7 @@ def create_graph(json_path: Path, output_path: Path):
 
 
 def main():
-    json_path = Path("/root/codex_baseline/cuda_omp_workdir/results_perf_nsys_baseline_hecbench/results.json")
+    json_path = Path("/path/to/workdir/cuda_omp_workdir/results_perf_nsys_baseline_hecbench/results.json")
     output_path = json_path.parent / "comparison.png"
     
     if not json_path.exists():

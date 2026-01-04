@@ -5,7 +5,7 @@
 	- original code from PARSEC Benchmark Suite
 	- parallelization with CUDA API has been applied by
 	
-	Sang-Ha (a.k.a Shawn) Lee - sl4ge@virginia.edu
+	Author Name - author@example.com
 	University of Virginia
 	Department of Electrical and Computer Engineering
 	Department of Computer Science

@@ -2,7 +2,7 @@
 /**
  * @file parser.inc
  * @date 2015-07-30
- * @author Tiago Lobato Gimenes    (tlgimenes@gmail.com)
+ * @author Author Name    (author@example.com)
  *
  * @copyright
  * This program is free software: you can redistribute it and/or modify

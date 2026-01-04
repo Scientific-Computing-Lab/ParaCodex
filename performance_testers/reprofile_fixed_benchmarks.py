@@ -7,9 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-DATA_SRC_ROOT = Path("/root/codex_baseline/cuda_omp_workdir/data/src")
-REFERENCE_ROOT = Path("/root/codex_baseline/hecbench_reference/src")
-RESULTS_JSON = Path("/root/codex_baseline/cuda_omp_workdir/results_perf_nsys_baseline_hecbench/results.json")
+DATA_SRC_ROOT = Path("/path/to/workdir/cuda_omp_workdir/data/src")
+REFERENCE_ROOT = Path("/path/to/workdir/hecbench_reference/src")
+RESULTS_JSON = Path("/path/to/workdir/cuda_omp_workdir/results_perf_nsys_baseline_hecbench/results.json")
 
 # Benchmarks to reprofile
 BENCHMARKS_TO_FIX = ["atomicIntrinsics-omp", "jacobi-omp", "meanshift-omp", "stencil1d-omp"]
@@ -196,7 +196,7 @@ def profile_benchmark(bench_name: str, runs: int = 2) -> float:
         clean_nsys_artifacts(bench_dir)
 
         # Kill GPU processes
-        kill_script = Path("/root/codex_baseline/kill_gpu_processes.py")
+        kill_script = Path("/path/to/workdir/kill_gpu_processes.py")
         if kill_script.exists():
             subprocess.run(
                 [sys.executable, str(kill_script)],

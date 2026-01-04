@@ -15,7 +15,7 @@
 //	UPDATE
 //======================================================================================================================================================150
 
-// 2009; Amittai Aviram; entire code written in C; 
+// 2009; Author Name; entire code written in C; 
 // 2010; Jordan Fix and Andrew Wilkes; code converted to CUDA; 
 // 2011.10; Lukasz G. Szafaryn; code converted to portable form, to C, OpenMP, CUDA, PGI versions; 
 // 2011.12; Lukasz G. Szafaryn; Split different versions for Rodinia.
@@ -798,7 +798,7 @@ usage_1( void )
 {
 
 	printf("B+ Tree of Order %d.\n", order);
-	printf("\tAmittai Aviram -- amittai.aviram@yale.edu  Version %s\n", Version);
+	printf("\tAuthor Name -- author@example.com  Version %s\n", Version);
 	printf("\tfollowing Silberschatz, Korth, Sidarshan, Database Concepts, 5th ed.\n\n");
 	printf("To build a B+ tree of a different order, start again and enter the order\n");
 	printf("as an integer argument:  bpt <order>.  ");

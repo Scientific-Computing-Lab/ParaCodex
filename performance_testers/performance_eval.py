@@ -12,7 +12,7 @@ Usage:
     python performance_eval.py <translated_code_path>
     
 Example:
-    python performance_eval.py /home/erel.kaplan/codex_baseline/cuda_omp_workdir/translated_serial_omp_20250906_113840_gpt_5_2nd_try
+    python performance_eval.py /home/erel.kaplan/workdir/cuda_omp_workdir/translated_serial_omp_20250906_113840_gpt_5_2nd_try
 """
 
 import argparse
@@ -34,20 +34,20 @@ except ImportError:
 class PerformanceEvaluator:
     def __init__(self, translated_code_path, base_src_path=None, test_original=False, test_only_original=False, original_src_path=None, use_cpu_timing=False, use_gpu_timing=False):
         self.translated_code_path = Path(translated_code_path)
-        self.base_src_path = Path(base_src_path) if base_src_path else Path("/root/codex_baseline/cuda_omp_workdir/data/src")
+        self.base_src_path = Path(base_src_path) if base_src_path else Path("/path/to/workdir/cuda_omp_workdir/data/src")
         self.use_cpu_timing = use_cpu_timing
         self.use_gpu_timing = use_gpu_timing
         
         if use_gpu_timing:
-            self.performance_tester_path = Path("/root/codex_baseline/cuda_omp_workdir/gpu_performance_tester.py")
+            self.performance_tester_path = Path("/path/to/workdir/cuda_omp_workdir/gpu_performance_tester.py")
         elif use_cpu_timing:
-            self.performance_tester_path = Path("/root/codex_baseline/cuda_omp_workdir/cpu_performance_tester.py")
+            self.performance_tester_path = Path("/path/to/workdir/cuda_omp_workdir/cpu_performance_tester.py")
         else:
-            self.performance_tester_path = Path("/root/codex_baseline/cuda_omp_workdir/performance_tester.py")
+            self.performance_tester_path = Path("/path/to/workdir/cuda_omp_workdir/performance_tester.py")
         
         self.test_original = test_original
         self.test_only_original = test_only_original
-        self.original_src_path = Path(original_src_path) if original_src_path else Path("/root/codex_baseline/data_backup/src")
+        self.original_src_path = Path(original_src_path) if original_src_path else Path("/path/to/workdir/data_backup/src")
         self.results = {}
         
         # Validate paths
@@ -527,7 +527,7 @@ Examples:
     parser.add_argument('translated_code_path', 
                        help='Path to the directory containing translated OMP code')
     parser.add_argument('--base-src', 
-                       help='Base source path containing {kernel_name}-omp directories (default: /root/codex_baseline/cuda_omp_workdir/data/src)')
+                       help='Base source path containing {kernel_name}-omp directories (default: /path/to/workdir/cuda_omp_workdir/data/src)')
     parser.add_argument('--test-original', action='store_true',
                        help='Also test the original code from data_backup/src')
     parser.add_argument('--test-only-original', action='store_true',
@@ -537,7 +537,7 @@ Examples:
     parser.add_argument('--use-gpu-timing', action='store_true',
                        help='Use GPU performance tester instead of wall clock performance tester')
     parser.add_argument('--original-src', 
-                       help='Path to original source code (default: /root/codex_baseline/data_backup/src)')
+                       help='Path to original source code (default: /path/to/workdir/data_backup/src)')
     
     args = parser.parse_args()
     

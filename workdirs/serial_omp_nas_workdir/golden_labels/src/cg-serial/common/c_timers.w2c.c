@@ -79,4 +79,4 @@ extern double timer_read(
 } /* timer_read */
 
 
-// Code was translated using: /mnt/lbosm1/home/yonif/NPB-fornow/NPB-paper/openacc-npb-saturator-transformed-intel_migration/CG/common/intel-application-migration-tool-for-openacc-to-openmp/src/intel-application-migration-tool-for-openacc-to-openmp -overwrite-input -suppress-openacc openacc-npb-saturator-transformed-intel_migration/CG/common/c_timers.w2c.c
+// Code was translated using: /mnt/lbosm1/home/user/NPB-fornow/NPB-paper/openacc-npb-saturator-transformed-intel_migration/CG/common/intel-application-migration-tool-for-openacc-to-openmp/src/intel-application-migration-tool-for-openacc-to-openmp -overwrite-input -suppress-openacc openacc-npb-saturator-transformed-intel_migration/CG/common/c_timers.w2c.c

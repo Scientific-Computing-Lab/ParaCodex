@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-DATA_SRC_ROOT = Path("/root/codex_baseline/cuda_omp_workdir/data/src")
+DATA_SRC_ROOT = Path("/path/to/workdir/cuda_omp_workdir/data/src")
 MAKEFILE_NAME = "Makefile.nvc"
 RUN_TARGET = "run"
 
@@ -255,7 +255,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--output",
         type=str,
-        default="/root/codex_baseline/cuda_omp_workdir/results_perf_nsys",
+        default="/path/to/workdir/cuda_omp_workdir/results_perf_nsys",
         help="Output directory for results",
     )
     args = parser.parse_args(argv)

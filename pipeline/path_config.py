@@ -2,7 +2,7 @@
 """
 Shared helpers for configuring Codex pipeline paths.
 
-The pipeline previously hard-coded `/root/codex_baseline/cuda_omp_workdir`.
+The pipeline previously hard-coded `/path/to/workdir/cuda_omp_workdir`.
 These helpers let us override the working directory (and related locations)
 via environment variables or command-line flags so the same scripts can run
 against alternate worktrees (e.g., serial_omp_nas_workdir@pipeline).
@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-DEFAULT_CODEX_WORKDIR = Path("/root/codex_baseline/cuda_omp_workdir")
+DEFAULT_CODEX_WORKDIR = Path("/path/to/workdir/cuda_omp_workdir")
 NAS_IDENTIFIER = "serial_omp_nas_workdir"
 
 

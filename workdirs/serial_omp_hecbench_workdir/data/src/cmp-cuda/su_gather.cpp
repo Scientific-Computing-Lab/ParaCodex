@@ -2,7 +2,7 @@
 /**
  * @file su_gather.cpp
  * @date 2017-03-06
- * @author Tiago Lobato Gimenes    (tlgimenes@gmail.com)
+ * @author Author Name    (author@example.com)
  *
  * @copyright
  * This program is free software: you can redistribute it and/or modify

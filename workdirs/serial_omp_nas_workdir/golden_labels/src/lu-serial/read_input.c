@@ -121,4 +121,4 @@ void read_input()
   printf("\n");
 }
 
-// Code was translated using: /mnt/lbosm1/home/yonif/NPB-fornow/NPB-paper/openacc-npb-saturator-transformed-intel_migration/LU/LU/intel-application-migration-tool-for-openacc-to-openmp/src/intel-application-migration-tool-for-openacc-to-openmp -overwrite-input -suppress-openacc openacc-npb-saturator-transformed-intel_migration/LU/LU/read_input.c
+// Code was translated using: /mnt/lbosm1/home/user/NPB-fornow/NPB-paper/openacc-npb-saturator-transformed-intel_migration/LU/LU/intel-application-migration-tool-for-openacc-to-openmp/src/intel-application-migration-tool-for-openacc-to-openmp -overwrite-input -suppress-openacc openacc-npb-saturator-transformed-intel_migration/LU/LU/read_input.c

@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 
 # Directories and build configuration
-DATA_SRC_ROOT = Path("/root/codex_baseline/cuda_omp_workdir/data/src")
+DATA_SRC_ROOT = Path("/path/to/workdir/cuda_omp_workdir/data/src")
 MAKEFILE_NAME = "Makefile.nvc"
 RUN_TARGET = "run"
 
@@ -214,13 +214,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--input",
         type=str,
-        default="/root/codex_baseline/pipeline/translated_codes",
+        default="/path/to/workdir/pipeline/translated_codes",
         help="Directory containing translated benchmark subdirectories with main_step*.cpp files",
     )
     parser.add_argument(
         "--output",
         type=str,
-        default="/root/codex_baseline/cuda_omp_workdir/results_steps",
+        default="/path/to/workdir/cuda_omp_workdir/results_steps",
         help="Output directory where per-benchmark results will be written",
     )
     parser.add_argument(

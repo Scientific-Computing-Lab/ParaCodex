@@ -11,12 +11,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-DATA_SRC_ROOT = Path("/root/codex_baseline/cuda_omp_workdir/data/src")
+DATA_SRC_ROOT = Path("/path/to/workdir/cuda_omp_workdir/data/src")
 # Reference files are the original OpenMP implementations from Hecbench repository
-# They are located in: /root/codex_baseline/hecbench_reference/src/<bench>-omp/main.cpp
-REFERENCE_ROOT = Path("/root/codex_baseline/hecbench_reference/src")
-BASELINE_ROOT = Path("/root/codex_baseline/pipeline/translated_codes_baseline_hecbench")
-PARACODEX_ROOT = Path("/root/codex_baseline/pipeline/translated_codes_hecbench")
+# They are located in: /path/to/workdir/hecbench_reference/src/<bench>-omp/main.cpp
+REFERENCE_ROOT = Path("/path/to/workdir/hecbench_reference/src")
+BASELINE_ROOT = Path("/path/to/workdir/pipeline/translated_codes_baseline_hecbench")
+PARACODEX_ROOT = Path("/path/to/workdir/pipeline/translated_codes_hecbench")
 BUILD_CMD = "make -f Makefile.nvc run"
 CLEAN_CMD = "make -f Makefile.nvc clean"
 
@@ -126,7 +126,7 @@ def run_nsys_in_dir(work_dir: Path, save_output_to: Optional[Path] = None) -> Tu
     clean_nsys_artifacts(work_dir)
 
     # Kill GPU processes after nsys run
-    kill_script = Path("/root/codex_baseline/kill_gpu_processes.py")
+    kill_script = Path("/path/to/workdir/kill_gpu_processes.py")
     if kill_script.exists():
         print(f"Running {kill_script} to clean up GPU processes...")
         subprocess.run(
@@ -294,7 +294,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--output",
         type=str,
-        default="/root/codex_baseline/cuda_omp_workdir/results_perf_nsys_baseline_hecbench",
+        default="/path/to/workdir/cuda_omp_workdir/results_perf_nsys_baseline_hecbench",
         help="Output directory for results",
     )
     parser.add_argument(

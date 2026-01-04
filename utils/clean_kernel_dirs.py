@@ -168,7 +168,7 @@ def main():
         default=['../pipeline/combined_serial_filenames.jsonl'],
         help='One or more input JSONL files (relative to the current directory)'
     )
-    parser.add_argument('--base_path', default='/root/codex_baseline/serial_omp_nas_workdir/data/src', help='Base path to the kernel directories')
+    parser.add_argument('--base_path', default='/path/to/workdir/serial_omp_nas_workdir/data/src', help='Base path to the kernel directories')
     parser.add_argument('--api', default='serial', help='API to clean')
     args = parser.parse_args()
     

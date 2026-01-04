@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-DATA_SRC_ROOT = Path("/root/codex_baseline/serial_omp_nas_workdir/data/src")
+DATA_SRC_ROOT = Path("/path/to/workdir/serial_omp_nas_workdir/data/src")
 BUILD_CMD = "make CC=nvc++ CLASS=EREL run"
 CLEAN_CMD = "make clean"
 
@@ -309,7 +309,7 @@ def run_nsys_in_dir(work_dir: Path, save_output_to: Optional[Path] = None) -> Tu
     clean_nsys_artifacts(work_dir)
 
     # Kill GPU processes after nsys run
-    kill_script = Path("/root/codex_baseline/kill_gpu_processes.py")
+    kill_script = Path("/path/to/workdir/kill_gpu_processes.py")
     if kill_script.exists():
         print(f"Running {kill_script} to clean up GPU processes...")
         subprocess.run(
@@ -1072,7 +1072,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--output",
         type=str,
-        default="/root/codex_baseline/serial_omp_nas_workdir/results_perf_nas_nsys",
+        default="/path/to/workdir/serial_omp_nas_workdir/results_perf_nas_nsys",
         help="Output directory for results",
     )
     parser.add_argument(

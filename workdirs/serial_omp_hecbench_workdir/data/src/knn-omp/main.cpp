@@ -4,7 +4,7 @@
  *      removed split query KNN computation
  *      added feature extraction with bilinear interpolation
  *
- * Last modified by Christopher B. Choy <chrischoy@ai.stanford.edu> 12/23/2016
+ * Last modified by Author Name <author@example.com> 12/23/2016
  */
 
 // Includes

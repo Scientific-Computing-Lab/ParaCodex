@@ -6,9 +6,9 @@
  * By Dr.Gang Mei
  *
  * Created on 2015.11.06, China University of Geosciences, 
- *                        gang.mei@cugb.edu.cn
+ *                        author@example.com
  * Revised on 2015.12.14, China University of Geosciences, 
- *                        gang.mei@cugb.edu.cn
+ *                        author@example.com
  * 
  * Related publications:
  *  1) "Evaluating the Power of GPU Acceleration for IDW Interpolation Algorithm"

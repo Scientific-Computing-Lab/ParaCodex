@@ -43,7 +43,7 @@
 ////  provided "as is" without express or implied warranty.                  //
 ////                                                                         //
 ////  Send comments or suggestions for this OpenACC version to               //
-////                      hpctools@cs.uh.edu                                 //
+////                      author@example.com                                 //
 ////
 ////  Information on NPB 3.3, including the technical report, the original   //
 ////  specifications, source code, results and information on how to submit  //
@@ -409,4 +409,4 @@ void verify(double xcr[5], double xce[5], double xci,
 }
 
 
-// Code was translated using: /mnt/lbosm1/home/yonif/NPB-fornow/NPB-paper/openacc-npb-saturator-transformed-intel_migration/LU/LU/intel-application-migration-tool-for-openacc-to-openmp/src/intel-application-migration-tool-for-openacc-to-openmp -overwrite-input -suppress-openacc openacc-npb-saturator-transformed-intel_migration/LU/LU/verify.c
+// Code was translated using: /mnt/lbosm1/home/user/NPB-fornow/NPB-paper/openacc-npb-saturator-transformed-intel_migration/LU/LU/intel-application-migration-tool-for-openacc-to-openmp/src/intel-application-migration-tool-for-openacc-to-openmp -overwrite-input -suppress-openacc openacc-npb-saturator-transformed-intel_migration/LU/LU/verify.c

@@ -6,7 +6,7 @@
  expression dataset.  In this program we implemented CCS biclustering. 
 
  Developer: Dr. Anindya Bhattacharya and Dr. Yan Cui, UTHSC, Memphis, TN, USA
- Email: anindyamail123@gmail.com; ycui2@uthsc.edu 
+ Email: author@example.com; author@example.com 
 
  Note: The minimum number of genes and the samples per bicluster is 10. 
  User can alter the minimum size by changing the values for 'mingene' 
