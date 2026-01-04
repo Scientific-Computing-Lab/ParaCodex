@@ -58,7 +58,7 @@ clean:
 # Correctness checking targets
 #===============================================================================
 
-GATE_ROOT ?= /root/codex_baseline/serial_omp_nas_workdir
+GATE_ROOT ?= $(abspath ../..)
 REF_DIR   ?= $(GATE_ROOT)/golden_labels/src
 REF_BIN   ?= $(REF_DIR)/$(BENCHMARKU)/$(BENCHMARK).$(CLASS).x
 REF_MAKE  ?= Makefile

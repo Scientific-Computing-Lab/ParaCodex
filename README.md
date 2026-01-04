@@ -310,6 +310,77 @@ After installation, ensure your working directory is properly configured:
 # Ensure `golden_labels/src` exists if you want to run the supervisor agent
 ```
 
+#### 📁 Path Configuration
+
+ParaCodex requires you to specify the working directory path when running pipeline scripts. Here are the paths you need to configure:
+
+**1. Codex Working Directory (`--codex-workdir`)**
+
+This is the main path you need to set when running translation scripts. It points to the benchmark-specific workdir:
+
+```bash
+# For Rodinia benchmarks
+--codex-workdir /path/to/paracodex/workdirs/serial_omp_rodinia_workdir/
+
+# For NAS benchmarks
+--codex-workdir /path/to/paracodex/workdirs/serial_omp_nas_workdir/
+
+# For HeCBench benchmarks
+--codex-workdir /path/to/paracodex/workdirs/serial_omp_hecbench_workdir/
+
+# For ParEval benchmarks
+--codex-workdir /path/to/paracodex/workdirs/cuda_omp_pareval_workdir/
+```
+
+**Alternative: Environment Variable**
+
+You can also set the `CODEX_WORKDIR` environment variable instead of using the `--codex-workdir` flag:
+
+```bash
+export CODEX_WORKDIR=/path/to/paracodex/workdirs/serial_omp_rodinia_workdir/
+python pipeline/initial_translation_codex.py --source-api serial --target-api omp
+```
+
+**2. Makefile Paths (`GATE_ROOT`)**
+
+The Makefiles in each kernel directory use `GATE_ROOT` to locate the GATE SDK for correctness checking. This is automatically set using relative paths:
+
+```makefile
+GATE_ROOT ?= $(abspath ../..)
+```
+
+This means `GATE_ROOT` is automatically resolved relative to the kernel directory (e.g., `workdirs/serial_omp_rodinia_workdir/`). **You typically don't need to change this** unless you have a custom directory structure.
+
+If you need to override it, you can set it when running make:
+
+```bash
+make -f Makefile.nvc GATE_ROOT=/custom/path/to/workdir
+```
+
+**3. Output Directories**
+
+Translation outputs are saved to directories relative to the pipeline directory:
+- Rodinia: `pipeline/rodinia_outputs/`
+- NAS: `pipeline/nas_outputs/`
+- HeCBench: `pipeline/hecbench_outputs/`
+- ParEval: `pipeline/pareval_outputs/`
+
+These paths are automatically determined based on the workdir name. **You don't need to configure these.**
+
+**Quick Path Setup Example:**
+
+```bash
+# Set your repository path
+export PARACODEX_ROOT="/path/to/paracodex"
+
+# For Rodinia benchmarks
+python pipeline/initial_translation_codex.py \
+    --codex-workdir $PARACODEX_ROOT/workdirs/serial_omp_rodinia_workdir/ \
+    --source-api serial \
+    --target-api omp \
+    --kernels nw
+```
+
 #### 🔄 1. Initial Translation
 
 Translate Rodinia benchmarks from serial to OpenMP:
