@@ -20,9 +20,9 @@
 static void setup(int *n1, int *n2, int *n3);
 static void mg3P(double u[], double v[], double r[],
                  double a[4], double c[4], int n1, int n2, int n3);
-static void psinv(double *orr, double *ou, int n1, int n2, int n3,
+static void psinv(double * __restrict__ orr, double * __restrict__ ou, int n1, int n2, int n3,
                   double c[4], int k);
-static void resid(double *ou, double *ov, double *orr, int n1, int n2, int n3,
+static void resid(double * __restrict__ ou, double * __restrict__ ov, double * __restrict__ orr, int n1, int n2, int n3,
                   double a[4], int k);
 static void rprj3(double *orr, int m1k, int m2k, int m3k,
                   double *os, int m1j, int m2j, int m3j, int k);
@@ -155,11 +155,13 @@ int main()
   lb = 1;
   k  = lt;
 
-#pragma omp target data map(tofrom:u[0:NR], v[0:NR], r[0:NR]) map(to:a[0:4], c[0:4])
+  #pragma omp target enter data map(alloc: u[0:NR], v[0:NR], r[0:NR])
+
 {
   setup(&n1, &n2, &n3);
   zero3(u, n1, n2, n3);
   zran3(v, n1, n2, n3, nx[lt], ny[lt], k);
+  #pragma omp target update to(v[0:NR])
 
   norm2u3(v, n1, n2, n3, &rnm2, &rnmu, nx[lt], ny[lt], nz[lt]);
 
@@ -177,6 +179,7 @@ int main()
   setup(&n1, &n2, &n3);
   zero3(u, n1, n2, n3);
   zran3(v, n1, n2, n3, nx[lt], ny[lt], k);
+  #pragma omp target update to(v[0:NR])
 
   timer_stop(T_init);
   tinit = timer_read(T_init);
@@ -205,6 +208,7 @@ int main()
   norm2u3(r, n1, n2, n3, &rnm2, &rnmu, nx[lt], ny[lt], nz[lt]);
 }
   timer_stop(T_bench);
+  #pragma omp target exit data map(from:u[0:NR], r[0:NR]) map(delete:v[0:NR])
 
   t = timer_read(T_bench);
 
@@ -378,48 +382,38 @@ static void psinv(double * __restrict__ orr, double * __restrict__ ou, int n1, i
   int i3, i2, i1;
   double c0, c1, c2;
 
-  double * __restrict__ r1, * __restrict__ r2;
+  size_t total = (size_t)n3*n2*n1;
 
   c0 = c[0];
   c1 = c[1];
   c2 = c[2];
 
-  size_t len = (size_t)n3*n2*n1;
-  r1 = (double*)malloc(len*sizeof(double));
-  r2 = (double*)malloc(len*sizeof(double));
-
   if (timeron) timer_start(T_psinv);
-  #pragma omp target data map(present:orr[0:len], ou[0:len]) map(alloc:r1[0:len], r2[0:len])
-  {
-  #pragma omp target teams loop collapse(3) map(present:orr[0:len], r1[0:len], r2[0:len]) firstprivate(n1,n2,n3)
-  for (i3 = 1; i3 < n3-1; i3++) {
-    for (i2 = 1; i2 < n2-1; i2++) {
-      for (i1 = 0; i1 < n1; i1++) {
-        I3D(r1, n1, n2, i3, i2, i1) = I3D(orr, n1, n2, i3, i2-1, i1) + I3D(orr, n1, n2, i3, i2+1, i1)
-               + I3D(orr, n1, n2, i3-1, i2, i1) + I3D(orr, n1, n2, i3+1, i2, i1);
-        I3D(r2, n1, n2, i3, i2, i1) = I3D(orr, n1, n2, i3-1, i2-1, i1) + I3D(orr, n1, n2, i3-1, i2+1, i1)
-               + I3D(orr, n1, n2, i3+1, i2-1, i1) + I3D(orr, n1, n2, i3+1, i2+1, i1);
-      }
-    }
-  }
-  #pragma omp target teams loop collapse(3) map(present:orr[0:len], ou[0:len], r1[0:len], r2[0:len]) firstprivate(c0,c1,c2,n1,n2,n3)
+  /* Fused psinv to remove temporary buffers and extra kernel launch. */
+  #pragma omp target teams loop collapse(3) map(present:orr[0:total],ou[0:total])
   for (i3 = 1; i3 < n3-1; i3++) {
     for (i2 = 1; i2 < n2-1; i2++) {
       for (i1 = 1; i1 < n1-1; i1++) {
+        double center = I3D(orr, n1, n2, i3, i2, i1);
+        double center_left = I3D(orr, n1, n2, i3, i2, i1-1);
+        double center_right = I3D(orr, n1, n2, i3, i2, i1+1);
+
+        double r1_center = I3D(orr, n1, n2, i3, i2-1, i1) + I3D(orr, n1, n2, i3, i2+1, i1)
+                         + I3D(orr, n1, n2, i3-1, i2, i1) + I3D(orr, n1, n2, i3+1, i2, i1);
+        double r1_left = I3D(orr, n1, n2, i3, i2-1, i1-1) + I3D(orr, n1, n2, i3, i2+1, i1-1)
+                       + I3D(orr, n1, n2, i3-1, i2, i1-1) + I3D(orr, n1, n2, i3+1, i2, i1-1);
+        double r1_right = I3D(orr, n1, n2, i3, i2-1, i1+1) + I3D(orr, n1, n2, i3, i2+1, i1+1)
+                        + I3D(orr, n1, n2, i3-1, i2, i1+1) + I3D(orr, n1, n2, i3+1, i2, i1+1);
+        double r2_center = I3D(orr, n1, n2, i3-1, i2-1, i1) + I3D(orr, n1, n2, i3-1, i2+1, i1)
+                         + I3D(orr, n1, n2, i3+1, i2-1, i1) + I3D(orr, n1, n2, i3+1, i2+1, i1);
+
         I3D(ou, n1, n2, i3, i2, i1) = I3D(ou, n1, n2, i3, i2, i1)
-                                    + c0 * I3D(orr, n1, n2, i3, i2, i1)
-                                    + c1 * ( I3D(orr, n1, n2, i3, i2, i1-1)
-                                             + I3D(orr, n1, n2, i3, i2, i1+1)
-											 + I3D(r1, n1, n2, i3, i2, i1) )
-									+ c2 * ( I3D(r2, n1, n2, i3, i2, i1)
-									         + I3D(r1, n1, n2, i3, i2, i1-1)
-											 + I3D(r1, n1, n2, i3, i2, i1+1));
+                                    + c0 * center
+                                    + c1 * (center_left + center_right + r1_center)
+                                    + c2 * (r2_center + r1_left + r1_right);
       }
     }
   }
-  }
-  free(r1);
-  free(r2);
   if (timeron) timer_stop(T_psinv);
 
   comm3(ou, n1, n2, n3, k);
@@ -435,53 +429,50 @@ static void psinv(double * __restrict__ orr, double * __restrict__ ou, int n1, i
   }
 }
 
-static void resid(double * ou, double * ov, double * orr, int n1, int n2, int n3,
+static void resid(double * __restrict__ ou, double * __restrict__ ov, double * __restrict__ orr, int n1, int n2, int n3,
                   double a[4], int k)
 {
 
   int i3, i2, i1;
   double a0, a2, a3;
   
-  double * __restrict__ u1, * __restrict__ u2;
+  size_t total = (size_t)n3*n2*n1;
 
   a0 = a[0];
   a2 = a[2];
   a3 = a[3];
 
-  size_t len = (size_t)n3*n2*n1;
-  u1 = (double*)malloc(len*sizeof(double));
-  u2 = (double*)malloc(len*sizeof(double));
-
   if (timeron) timer_start(T_resid);
-  #pragma omp target data map(present:ou[0:len], ov[0:len], orr[0:len]) map(alloc:u1[0:len], u2[0:len])
-  {
-  #pragma omp target teams loop collapse(3) map(present:ou[0:len], u1[0:len], u2[0:len]) firstprivate(n1,n2,n3)
-  for (i3 = 1; i3 < n3-1; i3++) {
-    for (i2 = 1; i2 < n2-1; i2++) {
-      for (i1 = 0; i1 < n1; i1++) {
-        I3D(u1, n1, n2, i3, i2, i1) = I3D(ou, n1, n2, i3, i2-1, i1) + I3D(ou, n1, n2, i3, i2+1, i1)
-               + I3D(ou, n1, n2, i3-1, i2, i1) + I3D(ou, n1, n2, i3+1, i2, i1);
-        I3D(u2, n1, n2, i3, i2, i1) = I3D(ou, n1, n2, i3-1, i2-1, i1) + I3D(ou, n1, n2, i3-1, i2+1, i1)
-               + I3D(ou, n1, n2, i3+1, i2-1, i1) + I3D(ou, n1, n2, i3+1, i2+1, i1);
-      }
-    }
-  }
-  #pragma omp target teams loop collapse(3) map(present:orr[0:len], ov[0:len], ou[0:len], u1[0:len], u2[0:len]) firstprivate(a0,a2,a3,n1,n2,n3)
+  /* Fused resid to avoid temporary buffers and extra kernel launch. */
+  #pragma omp target teams loop collapse(3) map(present:ou[0:total],ov[0:total],orr[0:total])
   for (i3 = 1; i3 < n3-1; i3++) {
     for (i2 = 1; i2 < n2-1; i2++) {
       for (i1 = 1; i1 < n1-1; i1++) {
-        I3D(orr, n1, n2, i3, i2, i1) = I3D(ov, n1, n2, i3, i2, i1) 
-							 -a0 * I3D(ou, n1, n2, i3, i2, i1)
+        double u_center = I3D(ou, n1, n2, i3, i2, i1);
+        double u_left = I3D(ou, n1, n2, i3, i2, i1-1);
+        double u_right = I3D(ou, n1, n2, i3, i2, i1+1);
 
-						 - a2 * ( I3D(u2, n1, n2, i3, i2, i1) + I3D(u1, n1, n2, i3, i2, i1-1)
-									+ I3D(u1, n1, n2, i3, i2, i1+1))
-						 - a3 * ( I3D(u2, n1, n2, i3, i2, i1-1) + I3D(u2, n1, n2, i3, i2, i1+1));
+        double u1_center = I3D(ou, n1, n2, i3, i2-1, i1) + I3D(ou, n1, n2, i3, i2+1, i1)
+                        + I3D(ou, n1, n2, i3-1, i2, i1) + I3D(ou, n1, n2, i3+1, i2, i1);
+        double u1_left = I3D(ou, n1, n2, i3, i2-1, i1-1) + I3D(ou, n1, n2, i3, i2+1, i1-1)
+                       + I3D(ou, n1, n2, i3-1, i2, i1-1) + I3D(ou, n1, n2, i3+1, i2, i1-1);
+        double u1_right = I3D(ou, n1, n2, i3, i2-1, i1+1) + I3D(ou, n1, n2, i3, i2+1, i1+1)
+                        + I3D(ou, n1, n2, i3-1, i2, i1+1) + I3D(ou, n1, n2, i3+1, i2, i1+1);
+
+        double u2_center = I3D(ou, n1, n2, i3-1, i2-1, i1) + I3D(ou, n1, n2, i3-1, i2+1, i1)
+                         + I3D(ou, n1, n2, i3+1, i2-1, i1) + I3D(ou, n1, n2, i3+1, i2+1, i1);
+        double u2_left = I3D(ou, n1, n2, i3-1, i2-1, i1-1) + I3D(ou, n1, n2, i3-1, i2+1, i1-1)
+                       + I3D(ou, n1, n2, i3+1, i2-1, i1-1) + I3D(ou, n1, n2, i3+1, i2+1, i1-1);
+        double u2_right = I3D(ou, n1, n2, i3-1, i2-1, i1+1) + I3D(ou, n1, n2, i3-1, i2+1, i1+1)
+                        + I3D(ou, n1, n2, i3+1, i2-1, i1+1) + I3D(ou, n1, n2, i3+1, i2+1, i1+1);
+
+        I3D(orr, n1, n2, i3, i2, i1) = I3D(ov, n1, n2, i3, i2, i1) 
+               - a0 * u_center
+               - a2 * (u2_center + u1_left + u1_right)
+               - a3 * (u2_left + u2_right);
       }
     }
   }
-  }
-  free(u1);
-  free(u2);
   if (timeron) timer_stop(T_resid);
 
   comm3(orr, n1, n2, n3, k);
@@ -504,9 +495,10 @@ static void rprj3(double *orr, int m1k, int m2k, int m3k,
   int j3, j2, j1, i3, i2, i1, d1, d2, d3, j;
 
   double *x1, *y1, x2, y2;
-  size_t len = (size_t)m3k*m2k*m1k;
-  x1 = (double*)malloc(len*sizeof(double));
-  y1 = (double*)malloc(len*sizeof(double));
+  size_t fine_total = (size_t)m3k*m2k*m1k;
+  size_t coarse_total = (size_t)m3j*m2j*m1j;
+  x1 = (double*)malloc(fine_total*sizeof(double));
+  y1 = (double*)malloc(fine_total*sizeof(double));
 
   if (timeron) timer_start(T_rprj3);
   if (m1k == 3) {
@@ -527,44 +519,41 @@ static void rprj3(double *orr, int m1k, int m2k, int m3k,
     d3 = 1;
   }
 
-  #pragma omp target data map(present:orr[0:len]) map(present:os[0:(size_t)m3j*m2j*m1j]) map(alloc:x1[0:len], y1[0:len])
+  #pragma omp target data map(present: orr[0:fine_total], os[0:coarse_total]) map(alloc: x1[0:fine_total], y1[0:fine_total])
   {
-  #pragma omp target teams loop collapse(3) map(present:orr[0:len], x1[0:len], y1[0:len]) firstprivate(m1k,m2k,m3k,m1j,m2j,m3j,d1,d2,d3)
-  for (j3 = 1; j3 < m3j-1; j3++) {
-    i3 = 2*j3-d3;
-    for (j2 = 1; j2 < m2j-1; j2++) {
-      i2 = 2*j2-d2;
-      for (j1 = 1; j1 < m1j; j1++) {
-        i1 = 2*j1-d1;
-		
-        I3D(x1, m1k, m2k, i3, i2, i1) = I3D(orr, m1k, m2k, i3+1, i2, i1) + I3D(orr, m1k, m2k, i3+1, i2+2, i1)
-               + I3D(orr, m1k, m2k, i3, i2+1, i1) + I3D(orr, m1k, m2k, i3+2, i2+1, i1);
-        I3D(y1, m1k, m2k, i3, i2, i1) = I3D(orr, m1k, m2k, i3, i2, i1)   + I3D(orr, m1k, m2k, i3+2, i2, i1)
-               + I3D(orr, m1k, m2k, i3, i2+2, i1) + I3D(orr, m1k, m2k, i3+2, i2+2, i1);
-				
+    #pragma omp target teams loop collapse(3) map(present:orr[0:fine_total],x1[0:fine_total],y1[0:fine_total])
+    for (j3 = 1; j3 < m3j-1; j3++) {
+      i3 = 2*j3-d3;
+      for (j2 = 1; j2 < m2j-1; j2++) {
+        i2 = 2*j2-d2;
+        for (j1 = 1; j1 < m1j; j1++) {
+          i1 = 2*j1-d1;
+          I3D(x1, m1k, m2k, i3, i2, i1) = I3D(orr, m1k, m2k, i3+1, i2, i1) + I3D(orr, m1k, m2k, i3+1, i2+2, i1)
+                 + I3D(orr, m1k, m2k, i3, i2+1, i1) + I3D(orr, m1k, m2k, i3+2, i2+1, i1);
+          I3D(y1, m1k, m2k, i3, i2, i1) = I3D(orr, m1k, m2k, i3, i2, i1)   + I3D(orr, m1k, m2k, i3+2, i2, i1)
+                 + I3D(orr, m1k, m2k, i3, i2+2, i1) + I3D(orr, m1k, m2k, i3+2, i2+2, i1);
+        }
       }
     }
-  }
-  #pragma omp target teams loop collapse(3) map(present:orr[0:len], os[0:(size_t)m3j*m2j*m1j], x1[0:len], y1[0:len]) firstprivate(m1k,m2k,m3k,m1j,m2j,m3j,d1,d2,d3)
-  for (j3 = 1; j3 < m3j-1; j3++) {
-    i3 = 2*j3-d3;
-    for (j2 = 1; j2 < m2j-1; j2++) {
-      i2 = 2*j2-d2;
-      for (j1 = 1; j1 < m1j-1; j1++) {
-        i1 = 2*j1-d1;
-		
-        y2 = I3D(orr, m1k, m2k, i3, i2, i1+1)   + I3D(orr, m1k, m2k, i3+2, i2, i1+1)
-           + I3D(orr, m1k, m2k, i3, i2+2, i1+1) + I3D(orr, m1k, m2k, i3+2, i2+2, i1+1);
-        x2 = I3D(orr, m1k, m2k, i3+1, i2, i1+1) + I3D(orr, m1k, m2k, i3+1, i2+2, i1+1)
-           + I3D(orr, m1k, m2k, i3, i2+1, i1+1) + I3D(orr, m1k, m2k, i3+2, i2+1, i1+1);
-        I3D(os, m1j, m2j, j3, j2, j1) = 
-                0.5 * I3D(orr, m1k, m2k, i3+1, i2+1, i1+1)
-              + 0.25 * (I3D(orr, m1k, m2k, i3+1, i2+1, i1) + I3D(orr, m1k, m2k, i3+1, i2+1, i1+2) + x2)
-              + 0.125 * ( I3D(x1, m1k, m2k, i3, i2, i1)+ I3D(x1, m1k, m2k, i3, i2, i1+2) + y2)
-              + 0.0625 * (I3D(y1, m1k, m2k, i3, i2, i1) + I3D(y1, m1k, m2k, i3, i2, i1+2));
+    #pragma omp target teams loop collapse(3) map(present:orr[0:fine_total],os[0:coarse_total],x1[0:fine_total],y1[0:fine_total])
+    for (j3 = 1; j3 < m3j-1; j3++) {
+      i3 = 2*j3-d3;
+      for (j2 = 1; j2 < m2j-1; j2++) {
+        i2 = 2*j2-d2;
+        for (j1 = 1; j1 < m1j-1; j1++) {
+          i1 = 2*j1-d1;
+          y2 = I3D(orr, m1k, m2k, i3, i2, i1+1)   + I3D(orr, m1k, m2k, i3+2, i2, i1+1)
+             + I3D(orr, m1k, m2k, i3, i2+2, i1+1) + I3D(orr, m1k, m2k, i3+2, i2+2, i1+1);
+          x2 = I3D(orr, m1k, m2k, i3+1, i2, i1+1) + I3D(orr, m1k, m2k, i3+1, i2+2, i1+1)
+             + I3D(orr, m1k, m2k, i3, i2+1, i1+1) + I3D(orr, m1k, m2k, i3+2, i2+1, i1+1);
+          I3D(os, m1j, m2j, j3, j2, j1) = 
+                  0.5 * I3D(orr, m1k, m2k, i3+1, i2+1, i1+1)
+                + 0.25 * (I3D(orr, m1k, m2k, i3+1, i2+1, i1) + I3D(orr, m1k, m2k, i3+1, i2+1, i1+2) + x2)
+                + 0.125 * ( I3D(x1, m1k, m2k, i3, i2, i1)+ I3D(x1, m1k, m2k, i3, i2, i1+2) + y2)
+                + 0.0625 * (I3D(y1, m1k, m2k, i3, i2, i1) + I3D(y1, m1k, m2k, i3, i2, i1+2));
+        }
       }
     }
-  }
   }
   if (timeron) timer_stop(T_rprj3);
 
@@ -591,25 +580,24 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
 
   int i3, i2, i1, d1, d2, d3, t1, t2, t3;
 
-  size_t len_fine = (size_t)n3*n2*n1;
-  size_t len_coarse = (size_t)mm3*mm2*mm1;
-
-  double *z1 = (double*)malloc(len_coarse*sizeof(double));
-  double *z2 = (double*)malloc(len_coarse*sizeof(double));
-  double *z3 = (double*)malloc(len_coarse*sizeof(double));
+  static double *z1, *z2, *z3;
+  size_t fine_total = (size_t)mm3*mm2*mm1;
+  size_t coarse_total = (size_t)n3*n2*n1;
+  z1 = (double*)malloc(fine_total*sizeof(double));
+  z2 = (double*)malloc(fine_total*sizeof(double));
+  z3 = (double*)malloc(fine_total*sizeof(double));
 
   if (timeron) timer_start(T_interp);
 
-  #pragma omp target data map(present:ou[0:len_fine], oz[0:len_coarse]) map(alloc:z1[0:len_coarse], z2[0:len_coarse], z3[0:len_coarse])
+  #pragma omp target data map(present: oz[0:fine_total], ou[0:coarse_total]) map(alloc: z1[0:fine_total], z2[0:fine_total], z3[0:fine_total])
   {
 
   if (n1 != 3 && n2 != 3 && n3 != 3) {
 
-    #pragma omp target teams loop collapse(3) map(present:oz[0:len_coarse], z1[0:len_coarse], z2[0:len_coarse], z3[0:len_coarse]) firstprivate(mm1,mm2,mm3)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = 0; i3 < mm3-1; i3++) {
       for (i2 = 0; i2 < mm2-1; i2++) {
         for (i1 = 0; i1 < mm1; i1++) {
-		
           I3D(z1, mm1, mm2, i3, i2, i1) = I3D(oz, mm1, mm2, i3, i2+1, i1)   
 		  								+ I3D(oz, mm1, mm2, i3, i2, i1);
 		  I3D(z2, mm1, mm2, i3, i2, i1) = I3D(oz, mm1, mm2, i3+1, i2, i1)   
@@ -621,7 +609,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
         }
       }
     }
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], oz[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = 0; i3 < mm3-1; i3++) {
       for (i2 = 0; i2 < mm2-1; i2++) {
         for (i1 = 0; i1 < mm1-1; i1++) {
@@ -635,7 +623,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
       }
     }
 
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], z1[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = 0; i3 < mm3-1; i3++) {
       for (i2 = 0; i2 < mm2-1; i2++) {
         for (i1 = 0; i1 < mm1-1; i1++) {
@@ -648,7 +636,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
         }
       }
     }
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], z2[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = 0; i3 < mm3-1; i3++) {
       for (i2 = 0; i2 < mm2-1; i2++) {
         for (i1 = 0; i1 < mm1-1; i1++) {
@@ -662,7 +650,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
        }
      }
  
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], z3[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = 0; i3 < mm3-1; i3++) {
       for (i2 = 0; i2 < mm2-1; i2++) {
         for (i1 = 0; i1 < mm1-1; i1++) {
@@ -700,7 +688,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
       t3 = 0;
     }
 
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], oz[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3,d1,d2,d3)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = d3; i3 <= mm3-1; i3++) {
       for (i2 = d2; i2 <= mm2-1; i2++) {
         for (i1 = d1; i1 <= mm1-1; i1++) {
@@ -711,7 +699,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
         }
        }
     }
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], oz[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3,d1,d2,d3,t1)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = d3; i3 <= mm3-1; i3++) {
       for (i2 = d2; i2 <= mm2-1; i2++) {
         for (i1 = 1; i1 <= mm1-1; i1++) {
@@ -723,7 +711,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
         }
       }
     }
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], oz[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3,d1,d2,d3,t2)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = d3; i3 <= mm3-1; i3++) {
       for (i2 = 1; i2 <= mm2-1; i2++) {
         for (i1 = d1; i1 <= mm1-1; i1++) {
@@ -735,7 +723,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
         }
 	  }
 	 }
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], oz[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3,d1,d2,d3,t1,t2)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = d3; i3 <= mm3-1; i3++) {
       for (i2 = 1; i2 <= mm2-1; i2++) {
         for (i1 = 1; i1 <= mm1-1; i1++) {
@@ -750,7 +738,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
       }
     }
 
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], oz[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3,d1,d2,d3,t2,t3)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = 1; i3 <= mm3-1; i3++) {
       for (i2 = d2; i2 <= mm2-1; i2++) {
         for (i1 = d1; i1 <= mm1-1; i1++) {
@@ -762,7 +750,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
         }
       }
     }
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], oz[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3,d1,d2,d3,t1,t2,t3)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = 1; i3 <= mm3-1; i3++) {
       for (i2 = d2; i2 <= mm2-1; i2++) {
         for (i1 = 1; i1 <= mm1-1; i1++) {
@@ -776,7 +764,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
         }
       }
     }
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], oz[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3,d1,d2,d3,t1,t2,t3)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = 1; i3 <= mm3-1; i3++) {
       for (i2 = 1; i2 <= mm2-1; i2++) {
         for (i1 = d1; i1 <= mm1-1; i1++) {
@@ -790,7 +778,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
         }
        }
      }
-    #pragma omp target teams loop collapse(3) map(present:ou[0:len_fine], oz[0:len_coarse]) firstprivate(mm1,mm2,mm3,n1,n2,n3,d1,d2,d3,t1,t2,t3)
+    #pragma omp target teams loop collapse(3) map(present:oz[0:fine_total],ou[0:coarse_total],z1[0:fine_total],z2[0:fine_total],z3[0:fine_total])
     for (i3 = 1; i3 <= mm3-1; i3++) {
       for (i2 = 1; i2 <= mm2-1; i2++) {
         for (i1 = 1; i1 <= mm1-1; i1++) {
@@ -810,7 +798,7 @@ static void interp(double *oz, int mm1, int mm2, int mm3,
     }
 
   }
-   }
+  }
 
   free(z1);
   free(z2);
@@ -846,16 +834,19 @@ static void norm2u3(double *orr, int n1, int n2, int n3,
 
   s = 0.0;
   *rnmu = 0.0;
-  temp = *rnmu;
-  #pragma omp target teams loop collapse(3) map(present:orr[0:(size_t)n1*n2*n3]) reduction(+:s) reduction(max:temp) firstprivate(n1,n2,n3)
-  for (i3 = 1; i3 < n3-1; i3++) {
-    for (i2 = 1; i2 < n2-1; i2++) {
-      for (i1 = 1; i1 < n1-1; i1++) {
-
-        s = s + pow(I3D(orr, n1, n2, i3, i2, i1), 2.0);
-        a = fabs(I3D(orr, n1, n2, i3, i2, i1));
-        
-        temp = max(temp, a);
+  temp = 0.0;
+  {
+    size_t total = (size_t)n3*n2*n1;
+    #pragma omp target teams loop collapse(3) reduction(+:s) reduction(max:temp) map(present: orr[0:total])
+    for (i3 = 1; i3 < n3-1; i3++) {
+      for (i2 = 1; i2 < n2-1; i2++) {
+        for (i1 = 1; i1 < n1-1; i1++) {
+          double val = I3D(orr, n1, n2, i3, i2, i1);
+          s = s + val * val;
+          a = fabs(val);
+          
+          temp = max(temp, a);
+        }
       }
     }
   }
@@ -876,8 +867,9 @@ static void comm3(double *ou, int n1, int n2, int n3, int kk)
 {
 
   int i1, i2, i3;
+  size_t total = (size_t)n3*n2*n1;
   if (timeron) timer_start(T_comm3);
-  #pragma omp target teams loop collapse(2) map(present:ou[0:(size_t)n1*n2*n3]) firstprivate(n1,n2,n3)
+  #pragma omp target teams loop collapse(2) map(present: ou[0:total])
   for (i3 = 1; i3 < n3-1; i3++) {
     for (i2 = 1; i2 < n2-1; i2++) {
 	
@@ -886,7 +878,7 @@ static void comm3(double *ou, int n1, int n2, int n3, int kk)
     }
   }
 
-  #pragma omp target teams loop collapse(2) map(present:ou[0:(size_t)n1*n2*n3]) firstprivate(n1,n2,n3)
+  #pragma omp target teams loop collapse(2) map(present: ou[0:total])
   for (i3 = 1; i3 < n3-1; i3++) {
     for (i1 = 0; i1 < n1; i1++) {
 	
@@ -895,7 +887,7 @@ static void comm3(double *ou, int n1, int n2, int n3, int kk)
     }
   }
 
-  #pragma omp target teams loop collapse(2) map(present:ou[0:(size_t)n1*n2*n3]) firstprivate(n1,n2,n3)
+  #pragma omp target teams loop collapse(2) map(present: ou[0:total])
   for (i2 = 0; i2 < n2; i2++) {
     for (i1 = 0; i1 < n1; i1++) {
 	
@@ -1100,7 +1092,6 @@ static void zran3(double *oz, int n1, int n2, int n3, int nx, int ny, int k)
     I3D(oz, n1, n2, i3, i2, i1) = +1.0;
   }
 
-  #pragma omp target update to(oz[0:(size_t)n1*n2*n3])
   comm3(oz, n1, n2, n3, k);
 
 }
@@ -1207,8 +1198,9 @@ static void zero3(double *oz, int n1, int n2, int n3)
 {
 
   int i1, i2, i3;
+  size_t total = (size_t)n3*n2*n1;
 
-#pragma omp target teams loop collapse(3) map(present:oz[0:n1*n2*n3])
+  #pragma omp target teams loop collapse(3) map(present: oz[0:total])
   for (i3 = 0; i3 < n3; i3++) {
     for (i2 = 0; i2 < n2; i2++) {
       for (i1 = 0; i1 < n1; i1++) {
