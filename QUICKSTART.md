@@ -1,226 +1,106 @@
 # ParaCodex Quick Start Guide
 
-This is a condensed guide to get you up and running quickly. For detailed information, see [README.md](README.md).
+Get up and running in 5 minutes. For full documentation, see [README.md](README.md).
 
 ## 🎯 Prerequisites Checklist
 
-Before running ParaCodex, ensure you have:
-
 - [ ] NVIDIA GPU with CUDA support
-- [ ] Node.js 22+ and npm 9+ installed
-- [ ] Codex CLI installed (`npm install -g @openai/codex`)
-- [ ] NVIDIA HPC SDK 25.7+ installed (`nvc++` compiler)
-- [ ] NVIDIA Nsight Systems 2025.3+ installed (`nsys` profiler)
-- [ ] Python 3.8+ installed
-- [ ] OpenAI API key
+- [ ] Node.js 22+ and npm 9+
+- [ ] NVIDIA HPC SDK 25.7+ (`nvc++` compiler)
+- [ ] Python 3.8+
+- [ ] OpenAI API key or OpenAI Pro account
 
-## ⚡ Quick Setup (5 minutes)
+## ⚡ Quick Setup
 
-### 1. Clone and Navigate
+### 1. Clone and navigate
 ```bash
 git clone https://github.com/Scientific-Computing-Lab/ParaCodex.git
-cd ParaCodex
+cd paracodex
+chmod +x setup_environment.sh install_nvidia_hpc_sdk.sh verify_environment.sh
 ```
 
-### 2. Verify Environment
+### 2. Install NVIDIA HPC SDK (if not already installed)
+```bash
+sudo ./install_nvidia_hpc_sdk.sh
+source ~/.bashrc
+```
+
+### 3. Run the environment setup
+```bash
+./setup_environment.sh
+```
+
+This installs all dependencies in one step: Codex CLI, Python packages, webapp dependencies, and copies the ParaCodex Codex skills to `~/.codex/skills/paracodex/`.
+
+### 4. Set up OpenAI access
+
+**Option 1: OpenAI Pro account (recommended)**
+```bash
+codex login
+```
+
+**Option 2: API key**
+```bash
+export OPENAI_API_KEY="your-api-key-here"
+```
+
+### 5. Verify your environment
 ```bash
 ./verify_environment.sh
 ```
 
-If you see ❌ errors, you can auto-install missing dependencies:
+## 🚀 Running ParaCodex
 
 ```bash
-# Auto-install NVIDIA HPC SDK (if missing)
-sudo ./install_nvidia_hpc_sdk.sh
-
-# Note: Nsight Systems (nsys) is bundled with HPC SDK - no separate install needed!
-# If nsys is not found after HPC SDK installation, ensure HPC SDK is in your PATH.
+cd pipeline/webapp
+bash start.sh
 ```
 
-### 3. Install Node.js Dependencies
-```bash
-# Install Codex CLI
-npm install -g @openai/codex
+Open **http://localhost:5000** in your browser.
 
-# Verify
-codex --version
-```
+### Using the web interface
 
-### 4. Install Python Dependencies
-```bash
-pip install -r requirements.txt
-```
+1. **Source Directory** — Browse to the folder with the code you want to translate
+2. **Source API** — The parallel API of your code (e.g. `serial`, `cuda`)
+3. **Target API** — The API to translate to (e.g. `omp`, `hip`)
+4. Click **Start Pipeline** — live logs stream in as the agent works
+5. Inspect translated code and profiling artifacts in the job view
 
-### 5. Set Up OpenAI API Access
+### Benchmark workdirs
 
-**Option 1: Login with OpenAI Pro Account (Recommended)**
-```bash
-# Interactive login (opens browser)
-codex login
-
-# Or login with API key
-echo $OPENAI_API_KEY | codex login --with-api-key
-
-# Verify login
-codex login status
-```
-
-**Option 2: Use API Key Environment Variable**
-```bash
-export OPENAI_API_KEY="your-api-key-here"
-```
-
-### 6. Test Your Setup
-```bash
-# Check Node.js and Codex CLI
-node --version
-codex --version
-
-# Check compiler
-nvc++ --version
-
-# Check profiler
-nsys --version
-
-# Check GPU
-nvidia-smi
-
-# Check Python packages
-python3 -c "import openai; print('OpenAI package OK')"
-```
-
-## 🚀 Running Your First Translation
-
-### Example 1: Serial to OpenMP (Single Kernel)
-```bash
-python pipeline/initial_translation_codex.py \
-    --source-api serial \
-    --target-api omp \
-    --kernels jacobi \
-    --results-dir ./results
-```
-
-### Example 2: Serial to OpenMP with Optimization
-```bash
-python pipeline/initial_translation_codex.py \
-    --source-api serial \
-    --target-api omp \
-    --kernels jacobi \
-    --results-dir ./results \
-    --optimize
-```
-
-### Example 3: Full Pipeline (Translation + Optimization + Correctness Checking)
-```bash
-python pipeline/initial_translation_codex.py \
-    --source-api serial \
-    --target-api omp \
-    --results-dir ./results \
-    --optimize \
-    --supervise \
-    --opt-supervisor-steps 2
-```
-
-### Example 4: Translate All Kernels
-```bash
-# Remove --kernels flag to process all kernels in the jsonl file
-python pipeline/initial_translation_codex.py \
-    --source-api serial \
-    --target-api omp \
-    --results-dir ./results \
-    --optimize
-```
-
-## 📊 Checking Results
-
-After translation, check the results directory:
-
-```bash
-ls -la results/
-
-# View the translated code
-cat results/jacobi-omp/initial/main.c
-
-# View optimization steps
-cat results/jacobi-omp/step1/main.c
-cat results/jacobi-omp/step2/main.c
-
-# View profiling data
-cat results/jacobi-omp/step1/nsys_relevant.txt
-
-# View AI agent reasoning
-cat results/jacobi-omp/analysis.md
-cat results/jacobi-omp/data_plan.md
-cat results/jacobi-omp/optimization_plan.md
-```
-
-## 🐳 Docker Alternative (Even Faster!)
-
-If you have Docker and NVIDIA Container Toolkit:
-
-```bash
-# Clone
-git clone https://github.com/Scientific-Computing-Lab/ParaCodex.git
-cd paracodex
-
-# Set API key
-export OPENAI_API_KEY="your-api-key-here"
-
-# Build and run
-docker build -t paracodex:latest .
-docker run --gpus all -it -e OPENAI_API_KEY="$OPENAI_API_KEY" -v $(pwd):/workspace paracodex:latest
-
-# Inside container, run translations
-python pipeline/initial_translation_codex.py --source-api serial --target-api omp --optimize
-```
+| Suite | Source directory |
+|-------|-----------------|
+| Rodinia | `workdirs/serial_omp_rodinia_workdir/data/src/` |
+| NAS | `workdirs/serial_omp_nas_workdir/data/src/` |
+| HeCBench | `workdirs/serial_omp_hecbench_workdir/data/src/` |
+| ParEval | `workdirs/cuda_omp_pareval_workdir/data/src/` |
 
 ## 🔧 Common Issues
 
-### Issue: `codex: command not found`
-**Solution**: Install Codex CLI via npm:
+**`codex: command not found`**
 ```bash
 npm install -g @openai/codex
-# If npm is not found, install Node.js first
 ```
 
-### Issue: `node: command not found`
-**Solution**: Install Node.js:
+**`node: command not found`**
 ```bash
-# Using nvm (recommended)
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
 source ~/.bashrc
 nvm install 22
-
-# Or using apt (Ubuntu)
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo apt-get install -y nodejs
 ```
 
-### Issue: `nvc++: command not found`
-**Solution**: Add NVIDIA HPC SDK to PATH:
+**`nvc++: command not found`**
 ```bash
 export PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/bin:$PATH
 export LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/lib:$LD_LIBRARY_PATH
 ```
 
-### Issue: `nsys: command not found`
-**Solution**: Install NVIDIA Nsight Systems from [NVIDIA website](https://developer.nvidia.com/nsight-systems).
-
-### Issue: `OPENAI_API_KEY not set` or Codex authentication failed
-**Solution**: 
+**Port 5000 already in use**
 ```bash
-# Option 1: Login with OpenAI Pro account (recommended)
-codex login
-
-# Option 2: Set API key environment variable
-export OPENAI_API_KEY="your-api-key-here"
-
-# Verify authentication
-codex login status
+FLASK_RUN_PORT=8080 python pipeline/webapp/app.py
 ```
 
-### Issue: GPU not accessible
-**Solution**: Check GPU status:
+**GPU not accessible**
 ```bash
 nvidia-smi
 # If this fails, check NVIDIA driver installation
@@ -228,17 +108,6 @@ nvidia-smi
 
 ## 📚 Next Steps
 
-- Read [README.md](README.md) for detailed usage examples and setup instructions
-- Check `pipeline/prompts.md` for AI prompt documentation (if available)
-- Explore example results in the `results/` directory
-
-## 🆘 Getting Help
-
-- Run `./verify_environment.sh` to diagnose setup issues
-- Check [README.md](README.md) for troubleshooting
-- Open an issue on GitHub for support
-
----
-
-**Ready to parallelize some code? Start with a simple kernel and work your way up!** 🚀
-
+- See [README.md](README.md) for detailed usage, troubleshooting, and benchmark workflows
+- See [pipeline/AGENTS.md](pipeline/AGENTS.md) for agent documentation
+- See [pipeline/prompts/](pipeline/prompts/) for AI prompt documentation

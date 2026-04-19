@@ -58,210 +58,127 @@ def find_benchmarks() -> List[str]:
     return sorted(benchmarks)
 
 
-def run_nsys_in_dir(work_dir: Path, save_output_to: Optional[Path] = None) -> Tuple[int, str]:
+def run_bench_in_dir(work_dir: Path, sm: str = "cc89") -> Tuple[int, str]:
     """
-    Run Nsight Systems on `make -f Makefile.nvc run` in the given directory,
-    capturing stdout which includes the cuda_gpu_kern_sum stats.
-    
-    If save_output_to is provided, the nsys output will be saved to that file
-    to reduce memory usage, and only a summary will be kept in memory.
+    Build and run the benchmark using NV_ACC_TIME=1 (nvc++ built-in GPU profiler).
+
+    NV_ACC_TIME=1 outputs per-region device timing to stderr without needing CUPTI,
+    making it compatible with Modal's gVisor-based A100 containers where nsys
+    CUPTI injection fails with UUID errors or segfaults.
+
+    Combined stdout+stderr is returned for parsing.
     """
-    print(f"Making clean in {work_dir}")
-    
+    print(f"Building in {work_dir}")
+
     # Check for Makefile.nvc
     mk = work_dir / "Makefile.nvc"
     if not mk.exists():
         return 2, f"Missing Makefile.nvc in {work_dir}"
 
     # Clean first
-    clean_cmd = ["make", "-f", "Makefile.nvc", "clean"]
     subprocess.run(
-        clean_cmd,
+        ["make", "-f", "Makefile.nvc", "clean", f"SM={sm}", "EXTRA_CFLAGS=-gpu=nomanaged"],
         cwd=str(work_dir),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
 
-    # Nsight Systems profile command
-    # Format: FORCE_OMP_GPU=1 OMP_TARGET_OFFLOAD=MANDATORY nsys profile ... make -f Makefile.nvc run
-    cmd = [
-        "sh",
-        "-c",
-        f"FORCE_OMP_GPU=1 OMP_TARGET_OFFLOAD=MANDATORY nsys profile --stats=true --trace=cuda,osrt "
-        f"--force-overwrite=true -o nsys_profile {BUILD_CMD}",
-    ]
+    # Build with -gpu=nomanaged to avoid UVM segfaults inside Modal gVisor
+    build_proc = subprocess.run(
+        ["make", "-f", "Makefile.nvc", f"SM={sm}", "EXTRA_CFLAGS=-gpu=nomanaged"],
+        cwd=str(work_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if build_proc.returncode != 0:
+        return build_proc.returncode, build_proc.stdout
 
-    # Set environment variables for OpenMP GPU offloading
+    # Dry-run to get the actual run command (e.g. "./main 100")
+    dry_run = subprocess.run(
+        ["make", "-n", "-f", "Makefile.nvc", "run", f"SM={sm}", "EXTRA_CFLAGS=-gpu=nomanaged"],
+        cwd=str(work_dir), stdout=subprocess.PIPE, text=True,
+    )
+    run_cmds = [ln.strip() for ln in dry_run.stdout.splitlines()
+                if ln.strip() and not ln.startswith("make")]
+    actual_run_cmd = run_cmds[-1] if run_cmds else "./main"
+
+    # Set environment for GPU offloading + nvc++ built-in profiler
     env = os.environ.copy()
     env["FORCE_OMP_GPU"] = "1"
     env["OMP_TARGET_OFFLOAD"] = "MANDATORY"
+    # NV_ACC_TIME=1 activates nvc++ built-in timing; output goes to stderr
+    env["NV_ACC_TIME"] = "1"
+    env["NVCOMPILER_ACC_TIME"] = "1"
 
-    # If saving to file, write directly to file to avoid keeping large output in memory
-    if save_output_to:
-        save_output_to.parent.mkdir(parents=True, exist_ok=True)
-        with open(save_output_to, "w") as f:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(work_dir),
-                env=env,
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-        # Read back only what we need for parsing
-        with open(save_output_to, "r") as f:
-            output = f.read()
-    else:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(work_dir),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        output = proc.stdout
-    
-    clean_nsys_artifacts(work_dir)
+    proc = subprocess.run(
+        ["sh", "-c", actual_run_cmd],
+        cwd=str(work_dir),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
-    # Kill GPU processes after nsys run
-    kill_script = Path("/path/to/workdir/kill_gpu_processes.py")
-    if kill_script.exists():
-        print(f"Running {kill_script} to clean up GPU processes...")
-        subprocess.run(
-            [sys.executable, str(kill_script)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-
-    return proc.returncode, output
+    # Combine stdout + stderr so the parser sees both program output and timing
+    combined = proc.stdout + "\n" + proc.stderr
+    return proc.returncode, combined
 
 
-def parse_total_gpu_time_ms(nsys_output: str) -> Optional[float]:
+def parse_total_gpu_time_ms(acc_output: str) -> Optional[float]:
     """
-    Parse Nsight Systems stdout and compute GPU time (kernel + memory).
+    Parse NV_ACC_TIME=1 output (nvc++ built-in profiler) and sum all device time.
+
+    The output looks like:
+        Accelerator Kernel Timing data
+        /path/to/main.cpp
+          main  NVIDIA  devicenum=0
+            time(us): 1,523,310
+            369: data region reached 2 times
+                369: data copyin transfers: 2
+                     device time(us): total=79,163 max=...
+                402: data copyout transfers: 2
+                     device time(us): total=1,444,147 max=...
+
+    We sum ALL 'device time(us): total=N' values (kernels + transfers).
     Returns time in milliseconds.
     """
-    if not nsys_output:
+    if not acc_output:
         return None
 
-    lines = nsys_output.splitlines()
-    kernel_ns = 0
-    memory_ns = 0
-
-    # Parse GPU kernel times from cuda_gpu_kern_sum
-    in_kernel_table = False
-    kernel_parsed = False
-    for line in lines:
-        if "cuda_gpu_kern_sum" in line or "CUDA GPU Kernel Summary" in line:
-            in_kernel_table = True
-            continue
-
-        if not in_kernel_table:
-            continue
-
-        if not line.strip():
-            if kernel_parsed:
-                break
-            continue
-
-        m = re.match(
-            r"^\s*([0-9]+(?:\.[0-9]+)?)\s+([0-9,]+)\s+([0-9,]+)\s+",
-            line,
-        )
-        if not m:
-            if kernel_parsed:
-                break
-            continue
-
-        _, total_time_ns_str, _ = m.groups()
+    total_us = 0
+    found = False
+    # Match lines like:  device time(us): total=79,163 ...
+    for m in re.finditer(r'device time\(us\):\s*total=([0-9,]+)', acc_output):
         try:
-            kernel_ns += int(total_time_ns_str.replace(",", ""))
-            kernel_parsed = True
+            total_us += int(m.group(1).replace(",", ""))
+            found = True
         except ValueError:
             continue
 
-    # Parse GPU memory transfer times from cuda_gpu_mem_time_sum
-    in_mem_table = False
-    mem_parsed = False
-    for line in lines:
-        if "cuda_gpu_mem_time_sum" in line or "CUDA GPU Memory Time Summary" in line:
-            in_mem_table = True
-            continue
-
-        if not in_mem_table:
-            continue
-
-        if not line.strip():
-            if mem_parsed:
-                break
-            continue
-
-        m = re.match(
-            r"^\s*([0-9]+(?:\.[0-9]+)?)\s+([0-9,]+)\s+([0-9,]+)\s+",
-            line,
-        )
-        if not m:
-            if "Time (%)" in line or "--------" in line:
-                continue
-            if mem_parsed:
-                break
-            continue
-
-        _, total_time_ns_str, _ = m.groups()
-        try:
-            mem_time = int(total_time_ns_str.replace(",", ""))
-            memory_ns += mem_time
-            mem_parsed = True
-        except ValueError:
-            continue
-
-    # Sum kernel + memory for GPU time
-    total_ns = kernel_ns + memory_ns
-
-    if total_ns > 0:
-        return total_ns / 1e6  # ns -> ms
+    if found and total_us > 0:
+        return total_us / 1e3  # us -> ms
     return None
 
 
-def profile_mean_ms(work_dir: Path, runs: int = 2, temp_dir: Optional[Path] = None) -> Optional[float]:
+def profile_mean_ms(work_dir: Path, runs: int = 2, temp_dir: Optional[Path] = None, sm: str = "cc89") -> Optional[float]:
     """
-    Run Nsight Systems multiple times and return the mean GPU time (ms).
-    
-    If temp_dir is provided, nsys output will be saved to disk to reduce memory usage.
+    Run the benchmark multiple times with NV_ACC_TIME=1 and return the mean GPU time (ms).
     """
     values: List[float] = []
     for run_idx in range(runs):
-        # Save output to temp file if temp_dir is provided
-        save_path = None
-        if temp_dir:
-            save_path = temp_dir / f"nsys_output_{work_dir.name}_run{run_idx}.txt"
-        
-        rc, out = run_nsys_in_dir(work_dir, save_output_to=save_path)
-        # Try to parse even if return code is non-zero, as nsys might have valid stats
-        # even if the program crashes during cleanup (e.g., meanshift-omp)
+        rc, out = run_bench_in_dir(work_dir, sm=sm)
         ms = parse_total_gpu_time_ms(out)
         if ms is None and rc != 0:
-            print(f"[WARN] nsys run {run_idx + 1} failed with return code {rc} and no valid stats found")
+            print(f"[WARN] run {run_idx + 1} failed with return code {rc} and no valid GPU time found")
             continue
         elif rc != 0:
-            print(f"[WARN] nsys run {run_idx + 1} had non-zero return code {rc} but stats were parsed successfully")
-        
-        # Clear output from memory after parsing
-        del out
-        
+            print(f"[WARN] run {run_idx + 1} had non-zero return code {rc} but GPU time was parsed")
+
         if ms is not None:
             values.append(ms)
-        
-        # Clean up temp file if it exists
-        if save_path and save_path.exists():
-            try:
-                save_path.unlink()
-            except Exception:
-                pass
-    
+
     if values:
         return sum(values) / len(values)
     return None
@@ -303,12 +220,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=2,
         help="Number of profiling runs per benchmark (default: 2)",
     )
+    parser.add_argument(
+        "--sm",
+        type=str,
+        default="cc89",
+        help="CUDA architecture target (default: cc89)",
+    )
     args = parser.parse_args(argv)
 
     out_dir = Path(args.output).resolve()
 
     # Preflight: ensure required tools exist in PATH
-    for tool in ("nsys", "make", "nvc++"):
+    for tool in ("make", "nvc++"):
         if shutil.which(tool) is None:
             print(f"Required tool not found in PATH: {tool}", file=sys.stderr)
             return 2
@@ -371,7 +294,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # Measure reference (copied from Hecbench repository)
         print(f"[INFO] {bench}: Measuring reference (Hecbench OpenMP)...")
-        ref_ms = profile_mean_ms(bench_dir, runs=args.runs, temp_dir=temp_dir)
+        ref_ms = profile_mean_ms(bench_dir, runs=args.runs, temp_dir=temp_dir, sm=args.sm)
         print(f"[INFO] {bench}: Reference GPU time: {ref_ms} ms" if ref_ms else f"[WARN] {bench}: Reference measurement failed")
 
         # Measure baseline
@@ -384,7 +307,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 shutil.copy2(ref_file, backup_file)
                 # Copy baseline file
                 shutil.copy2(baseline_file, ref_file)
-                baseline_ms = profile_mean_ms(bench_dir, runs=args.runs, temp_dir=temp_dir)
+                baseline_ms = profile_mean_ms(bench_dir, runs=args.runs, temp_dir=temp_dir, sm=args.sm)
                 print(f"[INFO] {bench}: Baseline GPU time: {baseline_ms} ms" if baseline_ms else f"[WARN] {bench}: Baseline measurement failed")
                 # Restore original
                 shutil.copy2(backup_file, ref_file)
@@ -406,7 +329,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 shutil.copy2(ref_file, backup_file)
                 # Copy paracodex file
                 shutil.copy2(paracodex_file, ref_file)
-                paracodex_ms = profile_mean_ms(bench_dir, runs=args.runs, temp_dir=temp_dir)
+                paracodex_ms = profile_mean_ms(bench_dir, runs=args.runs, temp_dir=temp_dir, sm=args.sm)
                 print(f"[INFO] {bench}: ParaCodex GPU time: {paracodex_ms} ms" if paracodex_ms else f"[WARN] {bench}: ParaCodex measurement failed")
                 # Restore original
                 shutil.copy2(backup_file, ref_file)

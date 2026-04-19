@@ -144,6 +144,60 @@ else
     echo "❌ nvidia-smi not found. GPU may not be accessible."
 fi
 
+# Install pipeline Node.js dependencies
+echo ""
+echo "Installing pipeline Node.js dependencies..."
+if command_exists npm; then
+    if [ -f "pipeline/package.json" ]; then
+        (cd pipeline && npm install)
+        if [ $? -eq 0 ]; then
+            echo "✅ Pipeline Node.js dependencies installed"
+        else
+            echo "⚠️  Some pipeline Node.js dependencies may have failed to install"
+        fi
+    else
+        echo "⚠️  pipeline/package.json not found — skipping"
+    fi
+else
+    echo "⚠️  npm not found — skipping pipeline Node.js dependencies"
+fi
+
+# Install webapp Python dependencies
+echo ""
+echo "Installing webapp Python dependencies..."
+if [ -f "pipeline/webapp/requirements.txt" ]; then
+    PIP_CMD=""
+    if command_exists pip3; then
+        PIP_CMD="pip3"
+    elif command_exists pip; then
+        PIP_CMD="pip"
+    fi
+    if [ -n "$PIP_CMD" ]; then
+        if $PIP_CMD install -r pipeline/webapp/requirements.txt; then
+            echo "✅ Webapp Python dependencies installed"
+        else
+            echo "⚠️  Some webapp dependencies may have failed to install"
+        fi
+    fi
+else
+    echo "⚠️  pipeline/webapp/requirements.txt not found — skipping"
+fi
+
+# Install ParaCodex skills for Codex CLI
+echo ""
+echo "Installing ParaCodex skills..."
+if [ -d "paracodex_skills/paracodex" ]; then
+    mkdir -p ~/.codex/skills
+    cp -r paracodex_skills/paracodex ~/.codex/skills/paracodex
+    if [ $? -eq 0 ]; then
+        echo "✅ ParaCodex skills installed to ~/.codex/skills/paracodex"
+    else
+        echo "❌ Failed to install ParaCodex skills"
+    fi
+else
+    echo "⚠️  paracodex_skills/ not found — skipping skills installation"
+fi
+
 # Check OpenAI API Key / Codex Login
 echo ""
 echo "Checking OpenAI API Access..."

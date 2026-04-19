@@ -1,0 +1,2837 @@
+I’m reading the target hardware summary and the serial-to-OMP step-1 instructions first, then I’ll inspect the LUD sources to find the smallest safe parallelization points before editing anything.
+[shell] $ /bin/bash -lc 'cat /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/system_info_summary.txt'
+=== CPU ===
+Architecture:                         x86_64
+CPU(s):                               20
+Model name:                           13th Gen Intel(R) Core(TM) i9-13905H
+Thread(s) per core:                   2
+Core(s) per socket:                   10
+Socket(s):                            1
+NUMA node0 CPU(s):                    0-19
+
+=== MEMORY ===
+Mem:            15Gi       3.1Gi       9.3Gi       4.0Mi       3.1Gi        12Gi
+Swap:          4.0Gi          0B       4.0Gi
+
+=== GPU ===
+| NVIDIA-SMI 580.102.01             Driver Version: 581.57         CUDA Version: 13.0     |
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+|   0  NVIDIA GeForce RTX 4060 ...    On  |   00000000:01:00.0  On |                  N/A |
+Driver Version                            : 581.57
+CUDA Version                              : 13.0
+        GPU Current Temp                  : 48 C
+    FB Memory Usage
+        Total                             : 8188 MiB
+        Reserved                          : 231 MiB
+        Used                              : 1448 MiB
+        Free                              : 6510 MiB
+
+[shell] $ /bin/bash -lc 'cat /root/.codex/skills/paracodex/paracodex-serial-omp-step1/SKILL.md'
+---
+name: paracodex-serial-omp-step1
+description: "ParaCodex prompt for serial omp step1 step."
+---
+
+# GPU Offload with OpenMP
+**Directory:** `{kernel_dir}/`  
+**Files:** {file_listing}  
+**Reference:** `{kernel_dir}/analysis.md`
+**Required:** 
+- Use `OMP_TARGET_OFFLOAD=MANDATORY` for all runs
+- Prefer `target teams loop` first for OpenMP 5+ GPU offload, but keep or switch to `target teams distribute parallel for` when it produces better device code or more reliable compiler/runtime behavior on this target.
+- Treat combined GPU kernel + memcpy + sync cost as the real performance target; do not accept a design that only improves kernel time.
+- Prefer an OpenMP structure that remains efficient as the problem grows; reject designs that only win on tiny runs by adding scaling-hostile launches, transfers, or host waits.
+
+**IMPORTANT:** YOU MAY MODIFY THE MAKEFILE TO ADD ANYTHING YOU NEED TO RUN THE CODE.
+
+**Structural Goal:** Choose the right offload unit before adding pragmas. Do not preserve a weak serial helper decomposition if a fused or flattened OpenMP offload unit will perform better.
+
+## Workflow
+
+### 0. Backup
+Save backup of {file_listing}.
+
+### 1. Get Baseline
+```bash
+cd {kernel_dir}
+{clean_cmd_str}
+timeout 300 {correctness_run_cmd} > baseline_output.txt 2>&1
+# Fallback: timeout 60 {correctness_fallback_cmd} > baseline_output.txt 2>&1
+grep -E "Verification|SUCCESSFUL|FAILED" baseline_output.txt
+DO NOT SKIP THIS STEP.
+```
+
+### 2. Choose Data Strategy
+Walk through IN ORDER, stop at first match:
+```
+RULE 1: Type B (Sparse/CSR)?              → STRATEGY A/C
+RULE 2: Type C1 (Iterative Solvers).      → STRATEGY C
+RULE 3: Type C2 (Multigrid)?              → STRATEGY A
+RULE 4: Outer A + inner E (per-thread RNG) → STRATEGY A
+RULE 5: Multiple independent kernels?     → STRATEGY B
+RULE 6: Otherwise                         → STRATEGY A
+```
+
+### 3. Create Data Management Plan
+**MANDATORY:** Create `data_plan.md` in `{kernel_dir}` using the template in `references/output.md`.
+**Reference:** `references/output.md` (Use entire file as template).
+
+**FIRST: Check if original algorithm can be simplified for GPU:**
+- Large scratch arrays for intermediate results → Can per-thread locals replace them?
+- Block-based iteration (for cache) → REMOVE blocking, use single parallel loop over ALL work items
+- Multi-stage with host sync → Can everything run in one kernel?
+
+**Rule:** If scratch arrays exist ONLY to avoid atomics on small data (<1KB), 
+DELETE them and use per-thread locals + atomic merge instead.
+
+**Block elimination:** If code has `for (blk = 0; blk < numblks; blk++)` with scratch arrays,
+this is a CPU cache optimization. For GPU: remove blocking, parallelize over all N items directly.
+
+**CUDA-serial port (Type H):** Eliminate the inner fake-thread loop entirely.
+Rewrite as scalar logic per outer work-item. Remove from map clauses any arrays
+only accessed inside the eliminated loop.
+
+Analyze ALL arrays and functions in the timed region to fill the plan.
+- The plan must decide whether to preserve the original loop/helper boundaries, fuse them, or rewrite them for GPU mapping.
+- The plan must record the default correctness size and one larger practical profiling size.
+- The larger profiling size must be chosen to expose sustained GPU behavior on the available hardware, not just millisecond-scale launch or transfer overhead.
+- Increase the profiling size until the GPU work is materially exercised or until memory/time limits make further growth impractical; do not stop at a token size increase.
+- If the benchmark framework offers multiple classes or problem sizes, prefer the largest size that fits comfortably and completes in a practical time budget.
+- Do not choose a structure only because it wins on a toy input if it creates per-stage, per-row, or per-launch overhead that will scale badly.
+
+**CRITICAL: After creating data_plan.md, you MUST proceed to Implement Data Plan in this same step1 phase. Do not stop after planning.**
+
+### 4. Implement Data Plan (REQUIRED - part of step1)
+**Use `data_plan.md` as implementation guide.**
+**Reference:** `references/examples.md` (Contains Code Examples, Map Clauses, and Parallelization Patterns).
+
+#### Step 4.1: Setup Data Structures
+From "Arrays Inventory" and "Data Movement Strategy" in your plan:
+- Declare device arrays/pointers as needed for chosen strategy.
+- Create allocation/initialization functions based on strategy (See `references/examples.md` for STRATEGY A/B/C details).
+
+#### Step 4.2: Implement Transfers
+From "H→D Transfers" and "D→H Transfers" sections:
+- Implement each transfer listed with timing specified in plan.
+- Use method appropriate for strategy (map clauses, omp_target_memcpy, update, etc.).
+
+#### Step 4.3: Offload Functions
+Use "Functions in Timed Region" table:
+- For each function where "Must Run On" = device:
+  - Add appropriate pragma for strategy (See `references/examples.md`).
+  - Include arrays from "Arrays Accessed" column.
+- If preserving helper boundaries creates fragmented tiny kernels, helper launch overhead, or repeated host/device sync, inline/fuse the affected stages instead of offloading each helper literally.
+
+#### Step 4.4: Main Program Flow
+Follow "Data Movement Strategy" timing:
+```
+[setup from plan]
+[H→D transfers at specified time]
+[timed computation - call functions]
+[D→H transfers at specified time]
+[cleanup]
+```
+
+#### Step 4.5: Profile Size Selection
+- Pick a default correctness size for fast validation and a separate larger profiling size for performance decisions.
+- The larger profiling size must be large enough to materially exercise the GPU on this hardware; avoid sizes that still produce only tiny, launch-dominated work unless the benchmark is inherently small.
+- Treat the larger profiling size as the performance reference for step1 structure choices.
+
+### 5. Update Makefile (REQUIRED)
+**CRITICAL: Update Makefile to ensure it compiles successfully.**
+- Check if code uses files from subdirectories (e.g., `common/`, `utilities/`).
+- Update `source` variable to include all required source files.
+- Update `obj` variable.
+- Add include paths (`CFLAGS += -Icommon`).
+- Ensure `make -f Makefile.nvc` works.
+- Replace all placeholders in generated files (`<RUN_ARGS>`, `<PROGRAM_NAME>`, `<SOURCE_FILES>`, etc.) with real values.
+- Ensure the produced `Makefile.nvc` supports a plain `make -f Makefile.nvc run` with no ad hoc variable overrides.
+- If a compiler switch is required, document the exact failure and
+    why the switch was necessary
+
+### 6. Compile and Test
+```bash
+{clean_cmd_str}
+{build_cmd_str}
+timeout 300 {correctness_run_cmd} > gpu_output.txt 2>&1
+# Fallback: timeout 60 {correctness_fallback_cmd} > gpu_output.txt 2>&1
+```
+If timeout/segfault: Remove `#pragma omp loop` from Type C inner loops.
+
+### 7. Verify Correctness
+```bash
+diff baseline_output.txt gpu_output.txt
+```
+
+### 8. Profile
+```bash
+{clean_cmd_str}
+{nsys_profile_cmd} > {profile_log_path} 2>&1
+# Fallback: {nsys_profile_fallback_cmd} > {profile_log_path} 2>&1
+grep -E "cuda_gpu_kern|CUDA GPU Kernel|GPU activities" {profile_log_path} | head -10 || echo "No kernel information found"
+```
+
+### 9. Step1 Exit Criteria
+Before finishing step1, verify all of the following:
+- The hot compute path is on the GPU.
+- The offload unit is appropriate for the workload size; do not leave a many-stage tiny-kernel design in place when fusion is possible.
+- There are no avoidable `target update` operations in the timed region.
+- The implementation is a plausible optimization base for step2, not just a minimally offloaded version.
+- The produced `Makefile.nvc` and related files contain no unresolved placeholders.
+- A plain `make -f Makefile.nvc run` succeeds as the final run check.
+- `{nsys_profile_cmd} > {profile_log_path} 2>&1` produces GPU kernel information in the log.
+- The chosen structure is still plausible for larger practical inputs, not only the smallest tested run, and the larger profiling size must materially exercise the GPU rather than merely increasing runtime by a small constant factor.
+
+# Rules
+- NO GIT COMMANDS.
+- DO NOT READ/WRITE OUTSIDE THE WORKING DIRECTORY.
+- ALWAYS CLEAN BEFORE BUILD.
+- You may create backup/output files.
+- Never run git commands.
+
+I’ve got the workflow constraints. Next I’m checking the kernel sources and the step-1 templates so I can decide whether LUD wants a fused offload region or a staged map/update plan before I touch code.
+[shell] $ /bin/bash -lc 'cp /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c.bak && cp /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/tools/gen_input.c /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/tools/gen_input.c.bak && cp /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud_base.c /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud_base.c.bak && cp /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c.bak && cp /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud_omp.c /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud_omp.c.bak && cp /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c.bak'
+[shell] $ /bin/bash -lc "cat /root/.codex/skills/paracodex/references/output.md && printf '\\n---EXAMPLES---\\n' && cat /root/.codex/skills/paracodex/references/examples.md"
+cat: /root/.codex/skills/paracodex/references/output.md: No such file or directory
+
+[shell] $ /bin/bash -lc "sed -n '1,220p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud_base.c && printf '\\n---OMP---\\n' && sed -n '1,260p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud_omp.c && printf '\\n---MAIN BASE---\\n' && sed -n '1,220p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c && printf '\\n---MAIN OMP---\\n' && sed -n '1,220p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c && printf '\\n---COMMON---\\n' && sed -n '1,220p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c && printf '\\n---GEN---\\n' && sed -n '1,220p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/tools/gen_input.c"
+void lud_base(float *a, int size)
+{
+     int i,j,k;
+     float sum;
+
+     for (i=0; i<size; i++){
+         for (j=i; j<size; j++){
+             sum=a[i*size+j];
+             for (k=0; k<i; k++) sum -= a[i*size+k]*a[k*size+j];
+             a[i*size+j]=sum;
+         }
+
+         for (j=i+1;j<size; j++){
+             sum=a[j*size+i];
+             for (k=0; k<i; k++) sum -=a[j*size+k]*a[k*size+i];
+             a[j*size+i]=sum/a[i*size+i];
+         }
+     }
+}
+
+---OMP---
+#include <stdio.h>
+
+#define BS 16
+
+#define AA(_i,_j) a[offset*size+_i*size+_j+offset]
+#define BB(_i,_j) a[_i*size+_j]
+
+void lud_diagonal_omp (float* a, int size, int offset)
+{
+    int i, j, k;
+    for (i = 0; i < BS; i++) {
+
+        for (j = i; j < BS; j++) {
+            for (k = 0; k < i ; k++) {
+                AA(i,j) = AA(i,j) - AA(i,k) * AA(k,j);
+            }
+        }
+
+        float temp = 1.f/AA(i,i);
+        for (j = i+1; j < BS; j++) {
+            for (k = 0; k < i ; k++) {
+                AA(j,i) = AA(j,i) - AA(j,k) * AA(k,i);
+            }
+            AA(j,i) = AA(j,i)*temp;
+        }
+    }
+
+}
+
+
+// implements block LU factorization
+void lud_omp(float *a, int size)
+{
+    int offset, chunk_idx, size_inter, chunks_in_inter_row, chunks_per_inter;
+
+    printf("running serial\n");
+    for (offset = 0; offset < size - BS ; offset += BS)
+    {
+        // lu factorization of left-top corner block diagonal matrix
+        lud_diagonal_omp(a, size, offset);
+
+        size_inter = size - offset -  BS;
+        chunks_in_inter_row  = size_inter/BS;
+
+        // calculate perimeter block matrices
+        for ( chunk_idx = 0; chunk_idx < chunks_in_inter_row; chunk_idx++)
+        {
+            int i, j, k, i_global, j_global, i_here, j_here;
+            float sum;
+            float temp[BS*BS] __attribute__ ((aligned (64)));
+
+            for (i = 0; i < BS; i++) {
+                for (j =0; j < BS; j++){
+                    temp[i*BS + j] = a[size*(i + offset) + offset + j ];
+                }
+            }
+            i_global = offset;
+            j_global = offset;
+
+            // processing top perimeter
+            j_global += BS * (chunk_idx+1);
+            for (j = 0; j < BS; j++) {
+                for (i = 0; i < BS; i++) {
+                    sum = 0.f;
+                    for (k=0; k < i; k++) {
+                        sum += temp[BS*i +k] * BB((i_global+k),(j_global+j));
+                    }
+                    i_here = i_global + i;
+                    j_here = j_global + j;
+                    BB(i_here, j_here) = BB(i_here,j_here) - sum;
+                }
+            }
+
+            // processing left perimeter
+            j_global = offset;
+            i_global += BS * (chunk_idx + 1);
+            for (i = 0; i < BS; i++) {
+                for (j = 0; j < BS; j++) {
+                    sum = 0.f;
+                    for (k=0; k < j; k++) {
+                        sum += BB((i_global+i),(j_global+k)) * temp[BS*k + j];
+                    }
+                    i_here = i_global + i;
+                    j_here = j_global + j;
+                    a[size*i_here + j_here] = ( a[size*i_here+j_here] - sum ) / a[size*(offset+j) + offset+j];
+                }
+            }
+
+        }
+
+        // update interior block matrices
+        chunks_per_inter = chunks_in_inter_row*chunks_in_inter_row;
+
+        for  (chunk_idx =0; chunk_idx < chunks_per_inter; chunk_idx++)
+        {
+            int i, j, k, i_global, j_global;
+            float temp_top[BS*BS] __attribute__ ((aligned (64)));
+            float temp_left[BS*BS] __attribute__ ((aligned (64)));
+            float sum[BS] __attribute__ ((aligned (64))) = {0.f};
+
+            i_global = offset + BS * (1 +  chunk_idx/chunks_in_inter_row);
+            j_global = offset + BS * (1 + chunk_idx%chunks_in_inter_row);
+
+            for (i = 0; i < BS; i++) {
+                for (j =0; j < BS; j++){
+                    temp_top[i*BS + j]  = a[size*(i + offset) + j + j_global ];
+                    temp_left[i*BS + j] = a[size*(i + i_global) + offset + j];
+                }
+            }
+
+            for (i = 0; i < BS; i++)
+            {
+                for (k=0; k < BS; k++) {
+                    for (j = 0; j < BS; j++) {
+                        sum[j] += temp_left[BS*i + k] * temp_top[BS*k + j];
+                    }
+                }
+                for (j = 0; j < BS; j++) {
+                    BB((i+i_global),(j+j_global)) -= sum[j];
+                    sum[j] = 0.f;
+                }
+            }
+        }
+    }
+
+    lud_diagonal_omp(a, size, offset);
+}
+
+---MAIN BASE---
+/*
+ * =====================================================================================
+ *
+ *       Filename:  suite.c
+ *
+ *    Description:  The main wrapper for the suite
+ *
+ *        Version:  1.0
+ *        Created:  10/22/2009 08:40:34 PM
+ *       Revision:  none
+ *       Compiler:  gcc
+ *
+ *         Author:  Liang Wang (lw2aw), lw2aw@virginia.edu
+ *        Company:  CS@UVa
+ *
+ * =====================================================================================
+ */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <stdlib.h>
+#include <assert.h>
+
+#include "common.h"
+
+static int do_verify = 0;
+
+static struct option long_options[] = {
+      /* name, has_arg, flag, val */
+      {"input", 1, NULL, 'i'},
+      {"size", 1, NULL, 's'},
+      {"verify", 0, NULL, 'v'},
+      {0,0,0,0}
+};
+
+extern void
+lud_base(float *m, int matrix_dim);
+
+int
+main ( int argc, char *argv[] )
+{
+  int matrix_dim = 32; /* default matrix_dim */
+  int opt, option_index=0;
+  func_ret_t ret;
+  const char *input_file = NULL;
+  float *m, *mm;
+  stopwatch sw;
+
+  while ((opt = getopt_long(argc, argv, "::vs:i:", 
+                            long_options, &option_index)) != -1 ) {
+      switch(opt){
+        case 'i':
+          input_file = optarg;
+          break;
+        case 'v':
+          do_verify = 1;
+          break;
+        case 's':
+          matrix_dim = atoi(optarg);
+          fprintf(stderr, "Currently not supported, use -i instead\n");
+          fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n", argv[0]);
+          exit(EXIT_FAILURE);
+        case '?':
+          fprintf(stderr, "invalid option\n");
+          break;
+        case ':':
+          fprintf(stderr, "missing argument\n");
+          break;
+        default:
+          fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n",
+                  argv[0]);
+          exit(EXIT_FAILURE);
+      }
+  }
+
+  if ( (optind < argc) || (optind == 1)) {
+      fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n", argv[0]);
+      exit(EXIT_FAILURE);
+  }
+  
+  if (input_file) {
+      printf("Reading matrix from file %s\n", input_file);
+      ret = create_matrix_from_file(&m, input_file, &matrix_dim);
+      if (ret != RET_SUCCESS) {
+          m = NULL;
+          fprintf(stderr, "error create matrix from file %s\n", input_file);
+          exit(EXIT_FAILURE);
+      }
+  } else {
+    printf("No input file specified!\n");
+    exit(EXIT_FAILURE);
+  } 
+
+  if (do_verify){
+    printf("Before LUD\n");
+    print_matrix(m, matrix_dim);
+    matrix_duplicate(m, &mm, matrix_dim);
+  }
+
+  stopwatch_start(&sw);
+  lud_base(m, matrix_dim);
+  stopwatch_stop(&sw);
+  printf("Time consumed(ms): %lf\n", 1000*get_interval_by_sec(&sw));
+
+  if (do_verify){
+    printf("After LUD\n");
+    print_matrix(m, matrix_dim);
+    printf(">>>Verify<<<<\n");
+    lud_verify(mm, m, matrix_dim); 
+    free(mm);
+  }
+
+  free(m);
+
+  return EXIT_SUCCESS;
+}				/* ----------  end of function main  ---------- */
+
+---MAIN OMP---
+/*
+ * =====================================================================================
+ *
+ *       Filename:  suite.c
+ *
+ *    Description:  The main wrapper for the suite
+ *
+ *        Version:  1.0
+ *        Created:  10/22/2009 08:40:34 PM
+ *       Revision:  none
+ *       Compiler:  gcc
+ *
+ *         Author:  Liang Wang (lw2aw), lw2aw@virginia.edu
+ *        Company:  CS@UVa
+ *
+ * =====================================================================================
+ */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <stdlib.h>
+#include <assert.h>
+
+#include "common.h"
+
+static int do_verify = 0;
+int omp_num_threads = 40;
+
+static struct option long_options[] = {
+  /* name, has_arg, flag, val */
+  {"input", 1, NULL, 'i'},
+  {"size", 1, NULL, 's'},
+  {"verify", 0, NULL, 'v'},
+  {0,0,0,0}
+};
+
+extern void
+lud_omp(float *m, int matrix_dim);
+
+int
+main ( int argc, char *argv[] )
+{
+  int matrix_dim = 32; /* default size */
+  int opt, option_index=0;
+  func_ret_t ret;
+  const char *input_file = NULL;
+  float *m, *mm;
+  stopwatch sw;
+
+	
+  while ((opt = getopt_long(argc, argv, "::vs:n:i:", 
+                            long_options, &option_index)) != -1 ) {
+    switch(opt){
+    case 'i':
+      input_file = optarg;
+      break;
+    case 'v':
+      do_verify = 1;
+      break;
+    case 'n':
+      omp_num_threads = atoi(optarg);
+      break;
+    case 's':
+      matrix_dim = atoi(optarg);
+      printf("Generate input matrix internally, size =%d\n", matrix_dim);
+      // fprintf(stderr, "Currently not supported, use -i instead\n");
+      // fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n", argv[0]);
+      // exit(EXIT_FAILURE);
+      break;
+    case '?':
+      fprintf(stderr, "invalid option\n");
+      break;
+    case ':':
+      fprintf(stderr, "missing argument\n");
+      break;
+    default:
+      fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n",
+	      argv[0]);
+      exit(EXIT_FAILURE);
+    }
+  }
+  
+  if ( (optind < argc) || (optind == 1)) {
+    fprintf(stderr, "Usage: %s [-v] [-n no. of threads] [-s matrix_size|-i input_file]\n", argv[0]);
+    exit(EXIT_FAILURE);
+  }
+
+  if (input_file) {
+    printf("Reading matrix from file %s\n", input_file);
+    ret = create_matrix_from_file(&m, input_file, &matrix_dim);
+    if (ret != RET_SUCCESS) {
+      m = NULL;
+      fprintf(stderr, "error create matrix from file %s\n", input_file);
+      exit(EXIT_FAILURE);
+    }
+  }
+  else if (matrix_dim) {
+    printf("Creating matrix internally size=%d\n", matrix_dim);
+    ret = create_matrix(&m, matrix_dim);
+    if (ret != RET_SUCCESS) {
+      m = NULL;
+      fprintf(stderr, "error create matrix internally size=%d\n", matrix_dim);
+      exit(EXIT_FAILURE);
+    }
+  }
+ 
+  else {
+    printf("No input file specified!\n");
+    exit(EXIT_FAILURE);
+  } 
+
+  if (do_verify){
+    printf("Before LUD\n");
+    /* print_matrix(m, matrix_dim); */
+    matrix_duplicate(m, &mm, matrix_dim);
+  }
+
+
+  stopwatch_start(&sw);
+  lud_omp(m, matrix_dim);
+  stopwatch_stop(&sw);
+  printf("Time consumed(ms): %lf\n", 1000*get_interval_by_sec(&sw));
+
+  if (do_verify){
+    printf("After LUD\n");
+    /* print_matrix(m, matrix_dim); */
+    printf(">>>Verify<<<<\n");
+    lud_verify(mm, m, matrix_dim); 
+    free(mm);
+  }
+  
+  free(m);
+
+  return EXIT_SUCCESS;
+}				/* ----------  end of function main  ---------- */
+
+---COMMON---
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+#include <math.h>
+
+#include "common.h"
+
+void stopwatch_start(stopwatch *sw){
+    if (sw == NULL)
+        return;
+
+    bzero(&sw->begin, sizeof(struct timeval));
+    bzero(&sw->end  , sizeof(struct timeval));
+
+    gettimeofday(&sw->begin, NULL);
+}
+
+void stopwatch_stop(stopwatch *sw){
+    if (sw == NULL)
+        return;
+
+    gettimeofday(&sw->end, NULL);
+}
+
+double 
+get_interval_by_sec(stopwatch *sw){
+    if (sw == NULL)
+        return 0;
+    return ((double)(sw->end.tv_sec-sw->begin.tv_sec)+(double)(sw->end.tv_usec-sw->begin.tv_usec)/1000000);
+}
+
+int 
+get_interval_by_usec(stopwatch *sw){
+    if (sw == NULL)
+        return 0;
+    return ((sw->end.tv_sec-sw->begin.tv_sec)*1000000+(sw->end.tv_usec-sw->begin.tv_usec));
+}
+
+func_ret_t 
+create_matrix_from_file(float **mp, const char* filename, int *size_p){
+  int i, j, size;
+  float *m;
+  FILE *fp = NULL;
+
+  fp = fopen(filename, "rb");
+  if ( fp == NULL) {
+      return RET_FAILURE;
+  }
+
+  fscanf(fp, "%d\n", &size);
+
+  m = (float*) malloc(sizeof(float)*size*size);
+  if ( m == NULL) {
+      fclose(fp);
+      return RET_FAILURE;
+  }
+
+  for (i=0; i < size; i++) {
+      for (j=0; j < size; j++) {
+          fscanf(fp, "%f ", m+i*size+j);
+      }
+  }
+
+  fclose(fp);
+
+  *size_p = size;
+  *mp = m;
+
+  return RET_SUCCESS;
+}
+
+
+func_ret_t
+create_matrix_from_random(float **mp, int size){
+  float *l, *u, *m;
+  int i,j,k;
+
+  srand(time(NULL));
+
+  l = (float*)malloc(size*size*sizeof(float));
+  if ( l == NULL)
+    return RET_FAILURE;
+
+  u = (float*)malloc(size*size*sizeof(float));
+  if ( u == NULL) {
+      free(l);
+      return RET_FAILURE;
+  }
+
+  for (i = 0; i < size; i++) {
+      for (j=0; j < size; j++) {
+          if (i>j) {
+              l[i*size+j] = GET_RAND_FP;
+          } else if (i == j) {
+              l[i*size+j] = 1;
+          } else {
+              l[i*size+j] = 0;
+          }
+      }
+  }
+
+  for (j=0; j < size; j++) {
+      for (i=0; i < size; i++) {
+          if (i>j) {
+              u[j*size+i] = 0;
+          }else {
+              u[j*size+i] = GET_RAND_FP; 
+          }
+      }
+  }
+
+  for (i=0; i < size; i++) {
+      for (j=0; j < size; j++) {
+          for (k=0; k <= MIN(i,j); k++)
+            m[i*size+j] = l[i*size+k] * u[j*size+k];
+      }
+  }
+
+  free(l);
+  free(u);
+
+  *mp = m;
+
+  return RET_SUCCESS;
+}
+
+void
+matrix_multiply(float *inputa, float *inputb, float *output, int size){
+  int i, j, k;
+
+  for (i=0; i < size; i++)
+    for (k=0; k < size; k++)
+      for (j=0; j < size; j++)
+        output[i*size+j] = inputa[i*size+k] * inputb[k*size+j];
+
+}
+
+func_ret_t
+lud_verify(float *m, float *lu, int matrix_dim){
+  int i,j,k;
+  float *tmp = (float*)malloc(matrix_dim*matrix_dim*sizeof(float));
+
+  for (i=0; i < matrix_dim; i ++)
+    for (j=0; j< matrix_dim; j++) {
+        float sum = 0;
+        float l,u;
+        for (k=0; k <= MIN(i,j); k++){
+            if ( i==k)
+              l=1;
+            else
+              l=lu[i*matrix_dim+k];
+            u=lu[k*matrix_dim+j];
+            sum+=l*u;
+        }
+        tmp[i*matrix_dim+j] = sum;
+    }
+  /* printf(">>>>>LU<<<<<<<\n"); */
+  /* for (i=0; i<matrix_dim; i++){ */
+  /*   for (j=0; j<matrix_dim;j++){ */
+  /*       printf("%f ", lu[i*matrix_dim+j]); */
+  /*   } */
+  /*   printf("\n"); */
+  /* } */
+  /* printf(">>>>>result<<<<<<<\n"); */
+  /* for (i=0; i<matrix_dim; i++){ */
+  /*   for (j=0; j<matrix_dim;j++){ */
+  /*       printf("%f ", tmp[i*matrix_dim+j]); */
+  /*   } */
+  /*   printf("\n"); */
+  /* } */
+  /* printf(">>>>>input<<<<<<<\n"); */
+  /* for (i=0; i<matrix_dim; i++){ */
+  /*   for (j=0; j<matrix_dim;j++){ */
+  /*       printf("%f ", m[i*matrix_dim+j]); */
+  /*   } */
+  /*   printf("\n"); */
+  /* } */
+
+  for (i=0; i<matrix_dim; i++){
+      for (j=0; j<matrix_dim; j++){
+          if ( fabs(m[i*matrix_dim+j]-tmp[i*matrix_dim+j]) > 0.0001)
+            printf("dismatch at (%d, %d): (o)%f (n)%f\n", i, j, m[i*matrix_dim+j], tmp[i*matrix_dim+j]);
+      }
+  }
+  free(tmp);
+}
+
+void
+matrix_duplicate(float *src, float **dst, int matrix_dim) {
+    int s = matrix_dim*matrix_dim*sizeof(float);
+   float *p = (float *) malloc (s);
+   memcpy(p, src, s);
+   *dst = p;
+}
+
+void
+print_matrix(float *m, int matrix_dim) {
+    int i, j;
+    for (i=0; i<matrix_dim;i++) {
+      for (j=0; j<matrix_dim;j++)
+        printf("%f ", m[i*matrix_dim+j]);
+      printf("\n");
+    }
+}
+
+
+// Generate well-conditioned matrix internally  by Ke Wang 2013/08/07 22:20:06
+
+func_ret_t
+create_matrix(float **mp, int size){
+  float *m;
+  int i,j;
+  float lamda = -0.001;
+  float coe[2*size-1];
+  float coe_i =0.0;
+
+  for (i=0; i < size; i++)
+    {
+      coe_i = 10*exp(lamda*i); 
+
+---GEN---
+#include <time.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+#ifdef FP_NUMBER
+typedef double FP_NUMBER;
+#else
+typedef float FP_NUMBER;
+#endif
+
+
+#define GET_RAND_FP ((FP_NUMBER)rand()/((FP_NUMBER)(RAND_MAX)+(FP_NUMBER)(1)))
+char L_FNAME[32], U_FNAME[32], A_FNAME[32];
+
+int main (int argc, char **argv){
+    int i,j,k,MatrixDim;
+    FP_NUMBER sum, **L, **U, **A;
+    FILE *fl,*fu,*fa;
+
+    if ( argc < 2) {
+        printf("./gen_input [Matrix_Dimension_size]\n");
+        return 1;
+    }
+
+    MatrixDim = atoi(argv[1]);
+    L = (FP_NUMBER **) malloc(sizeof(FP_NUMBER*)*MatrixDim);
+    U = (FP_NUMBER **) malloc(sizeof(FP_NUMBER*)*MatrixDim);
+    A = (FP_NUMBER **) malloc(sizeof(FP_NUMBER*)*MatrixDim);
+
+    if ( !L || !U || !A){
+        printf("Can not allocate memory\n");
+        if (L) free(L);
+        if (U) free(U);
+        if (A) free(A);
+        return 1;
+    }
+
+    srand(time(NULL));
+
+    sprintf(L_FNAME, "l-%d.dat", MatrixDim);
+    fl = fopen(L_FNAME, "wb");
+    if (fl == NULL) {
+        printf("Cannot open file %s\n", L_FNAME);
+        return 1;
+    }
+
+    sprintf(U_FNAME, "u-%d.dat", MatrixDim);
+    fu = fopen(U_FNAME, "wb");
+    if (fu == NULL) {
+        printf("Cannot open file %s\n", U_FNAME);
+        return 1;
+    }
+
+    sprintf(A_FNAME, "%d.dat", MatrixDim);
+    fa = fopen(A_FNAME, "wb");
+    if (!fa) {
+        printf("Cannot open file %s\n", A_FNAME);
+        return 1;
+    }
+
+    for (i=0; i < MatrixDim; i ++){
+        L[i]=(FP_NUMBER*)malloc(sizeof(FP_NUMBER)*MatrixDim);
+        U[i]=(FP_NUMBER*)malloc(sizeof(FP_NUMBER)*MatrixDim);
+        A[i]=(FP_NUMBER*)malloc(sizeof(FP_NUMBER)*MatrixDim);
+    }
+    for (i=0; i < MatrixDim; i ++){
+        for (j=0; j < MatrixDim; j++){
+            if ( i == j) {
+                L[i][j] = 1.0;
+                U[i][j] = GET_RAND_FP;
+            } else if (i < j){
+                L[i][j] = 0;
+                U[i][j] = GET_RAND_FP;
+            } else { // i > j
+                L[i][j] = GET_RAND_FP;
+                U[i][j] = 0;
+            }
+        }
+    }
+
+    for (i=0; i < MatrixDim; i++ ) {
+        for (j=0; j < MatrixDim; j++){
+            sum = 0;
+            for(k=0; k < MatrixDim; k++)
+                sum += L[i][k]*U[k][j];
+            A[i][j] = sum;
+        }
+    }
+
+    for (i=0; i < MatrixDim; i ++) {
+        for (j=0; j < MatrixDim; j++)
+            fprintf(fl, "%f ", L[i][j]);
+        fprintf(fl, "\n");
+    }
+    fclose(fl);
+
+    for (i=0; i < MatrixDim; i ++) {
+        for (j=0; j < MatrixDim; j++)
+            fprintf(fu, "%f ", U[i][j]);
+        fprintf(fu, "\n");
+    }
+    fclose(fu);
+
+    fprintf(fa, "%d\n", MatrixDim);
+    for (i=0; i < MatrixDim; i ++) {
+        for (j=0; j < MatrixDim; j++)
+            fprintf(fa, "%f ", A[i][j]);
+        fprintf(fa, "\n");
+    }
+    fclose(fa);
+
+    for (i = 0; i < MatrixDim; i ++ ){
+        free(L[i]);
+        free(U[i]);
+        free(A[i]);
+    }
+    free(L);
+    free(U);
+    free(A);
+
+    return 0;
+}
+
+The kernel is a blocked LU with a serial diagonal block and two perimeter phases that feed a dense trailing update. I’m locating the local templates and build files now so I can keep the first OMP step structurally correct rather than just sprinkling pragmas.
+[shell] $ /bin/bash -lc "find /root/.codex/skills/paracodex -path '*/references/output.md' -o -path '*/references/examples.md' -o -path '*/analysis.md'"
+/root/.codex/skills/paracodex/paracodex-serial-cuda-step2/references/examples.md
+/root/.codex/skills/paracodex/paracodex-serial-cuda-step2/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-ocl-step1/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-ocl-step1/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-hip-step2/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-hip-step2/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-sycl-analysis/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-sycl-analysis/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-ocl-analysis/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-ocl-analysis/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-omp-step2/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-omp-step2/references/output.md
+/root/.codex/skills/paracodex/paracodex-serial-omp-step1/references/examples.md
+/root/.codex/skills/paracodex/paracodex-serial-omp-step1/references/output.md
+/root/.codex/skills/paracodex/paracodex-serial-omp-step2/references/examples.md
+/root/.codex/skills/paracodex/paracodex-serial-omp-step2/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-hip-analysis/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-hip-analysis/references/output.md
+/root/.codex/skills/paracodex/paracodex-serial-omp-analysis/references/examples.md
+/root/.codex/skills/paracodex/paracodex-serial-omp-analysis/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-sycl-step1/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-sycl-step1/references/output.md
+/root/.codex/skills/paracodex/paracodex-ocl-cuda-analysis/references/examples.md
+/root/.codex/skills/paracodex/paracodex-ocl-cuda-analysis/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-sycl-step2/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-sycl-step2/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-ocl-step2/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-ocl-step2/references/output.md
+/root/.codex/skills/paracodex/paracodex-supervisor/references/output.md
+/root/.codex/skills/paracodex/paracodex-ocl-cuda-step1/references/examples.md
+/root/.codex/skills/paracodex/paracodex-ocl-cuda-step1/references/output.md
+/root/.codex/skills/paracodex/paracodex-serial-cuda-step1/references/examples.md
+/root/.codex/skills/paracodex/paracodex-serial-cuda-step1/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-omp-step1/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-omp-step1/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-omp-analysis/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-omp-analysis/references/output.md
+/root/.codex/skills/paracodex/paracodex-cuda-hip-step1/references/examples.md
+/root/.codex/skills/paracodex/paracodex-cuda-hip-step1/references/output.md
+/root/.codex/skills/paracodex/paracodex-ocl-cuda-step2/references/examples.md
+/root/.codex/skills/paracodex/paracodex-ocl-cuda-step2/references/output.md
+/root/.codex/skills/paracodex/paracodex-serial-cuda-analysis/references/examples.md
+/root/.codex/skills/paracodex/paracodex-serial-cuda-analysis/references/output.md
+
+[shell] $ /bin/bash -lc "sed -n '1,220p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/Makefile.nvc"
+# Makefile for lud-serial (omp version)
+
+#===============================================================================
+# User Options
+#===============================================================================
+
+# Compiler can be set below, or via environment variable
+CC        = nvc++
+OPTIMIZE  = yes
+DEBUG     = no
+DEVICE    = gpu
+SM        = cc89
+LAUNCHER  =
+GATE_ROOT ?= $(abspath ../..)
+REF_DIR   ?= $(GATE_ROOT)/golden_labels/src/lud-serial
+REF_BIN   ?= $(REF_DIR)/main
+REF_MAKE  ?= Makefile.nvc
+VERIFY_CPPFLAGS ?= -DGATE_VERIFY
+
+RUN_ARGS ?= <RUN_ARGS>
+
+#===============================================================================
+# Program name & source code list
+#===============================================================================
+
+program = <PROGRAM_NAME>
+
+source = <SOURCE_FILES>
+
+obj = $(source:.cpp=.o)
+
+#===============================================================================
+# Sets Flags
+#===============================================================================
+
+# Standard Flags
+CFLAGS := $(EXTRA_CFLAGS) -std=c++14 -Wall -I$(GATE_ROOT)/gate_sdk
+LDFLAGS = 
+
+# Debug Flags
+ifeq ($(DEBUG),yes)
+  CFLAGS += -g -DDEBUG
+  LDFLAGS  += -g
+endif
+
+
+# Optimization Flags
+ifeq ($(OPTIMIZE),yes)
+  CFLAGS += -O3
+endif
+
+ifeq ($(DEVICE),gpu)
+  CFLAGS +=-Minfo -mp=gpu -gpu=$(SM)
+else
+  CFLAGS +=-qopenmp
+endif
+#===============================================================================
+# Targets to Build
+#===============================================================================
+
+$(program): $(obj)
+	$(CC) $(CFLAGS) $(obj) -o $@ $(LDFLAGS)
+
+%.o: %.cpp
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -rf $(program) $(obj)
+
+run: $(program)
+	$(LAUNCHER) ./$(program) $(RUN_ARGS)
+
+.PHONY: ref_build
+ref_build:
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) clean
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) CC="$(CC)" OPTIMIZE="$(OPTIMIZE)" DEBUG="$(DEBUG)" DEVICE="$(DEVICE)" SM="$(SM)" CFLAGS="$(CFLAGS) -I$(GATE_ROOT)/gate_sdk"
+
+.PHONY: verify_build
+verify_build:
+	$(MAKE) -f Makefile.nvc clean
+	$(MAKE) -f Makefile.nvc EXTRA_CFLAGS="$(VERIFY_CPPFLAGS) $(EXTRA_CFLAGS)"
+
+.PHONY: ref_verify_build
+ref_verify_build:
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) clean
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) CC="$(CC)" OPTIMIZE="$(OPTIMIZE)" DEBUG="$(DEBUG)" DEVICE="$(DEVICE)" SM="$(SM)" CFLAGS="$(VERIFY_CPPFLAGS) $(CFLAGS) -I$(GATE_ROOT)/gate_sdk"
+
+.PHONY: check-correctness
+check-correctness: verify_build ref_verify_build
+	OMP_TARGET_OFFLOAD=MANDATORY python3 $(GATE_ROOT)/gate_sdk/scripts/gate_harness.py $(REF_BIN) ./$(program) $(RUN_ARGS)
+
+[shell] $ /bin/bash -lc 'find /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp -maxdepth 2 -type f | sort'
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/Makefile.nvc
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/analysis.md
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c.bak
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud_base.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud_base.c.bak
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c.bak
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c.bak
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud_omp.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud_omp.c.bak
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/tools/gen_input.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/tools/gen_input.c.bak
+
+The shipped Makefile is a placeholder mismatch: it expects `.cpp` sources while the tree is `.c`. I’m pulling the local analysis plus the step-1 template now, then I’ll wire the build and offload path around that reality instead of fighting the template blindly.
+[shell] $ /bin/bash -lc 'cat /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/analysis.md'
+# Analysis Output Template
+
+## Loop Nesting Structure
+```
+- lud_omp offset loop (omp/lud_omp.c:37) Type E
+  - lud_diagonal_omp block helper (omp/lud_omp.c:11) Type E
+  - perimeter chunk loop (omp/lud_omp.c:46) Type A
+  - interior chunk loop (omp/lud_omp.c:94) Type A
+```
+
+## Loop Details
+
+### Loop: lud_omp at omp/lud_omp.c:37
+- **Iterations:** `size / BS`
+- **Type:** E - stage recurrence; each offset depends on the previous block factorization.
+- **Parent loop:** none
+- **Contains:** diagonal block helper call, perimeter chunk loop, interior chunk loop
+- **Dependencies:** stage / recurrence
+- **Nested bounds:** variable
+- **Private vars:** `offset`, `chunk_idx`, `size_inter`, `chunks_in_inter_row`, `chunks_per_inter`
+- **Arrays:** `a(RW)`
+- **Issues:** stage dependency, helper fragmentation risk, variable bounds
+
+### Loop: lud_diagonal_omp at omp/lud_omp.c:11
+- **Iterations:** `BS` (fixed at 16)
+- **Type:** E - block-local recurrence; later rows in the block depend on earlier ones.
+- **Parent loop:** line 37
+- **Contains:** two fixed-size inner `j` loops and reduction-like `k` loops
+- **Dependencies:** recurrence
+- **Nested bounds:** constant
+- **Private vars:** `i`, `j`, `k`, `temp`
+- **Arrays:** `a(RW)`
+- **Issues:** fixed small block, sequential helper, not a good independent offload unit
+
+### Loop: lud_omp at omp/lud_omp.c:46
+- **Iterations:** `chunks_in_inter_row`
+- **Type:** A - each chunk updates a disjoint perimeter block.
+- **Parent loop:** line 37
+- **Contains:** scratch copy loop and two fixed-size update nests
+- **Dependencies:** none at chunk level; inner `k` loops are local reductions
+- **Nested bounds:** variable
+- **Private vars:** `chunk_idx`, `i`, `j`, `k`, `i_global`, `j_global`, `i_here`, `j_here`, `sum`, `temp`
+- **Arrays:** `a(RW)`, `temp(W, local scratch)`
+- **Issues:** scratch temp, inner reductions, block-size constant
+
+### Loop: lud_omp at omp/lud_omp.c:94
+- **Iterations:** `chunks_per_inter`
+- **Type:** A - each iteration updates a distinct interior block.
+- **Parent loop:** line 37
+- **Contains:** scratch copy loops and a fixed-size block multiply-update nest
+- **Dependencies:** none at chunk level; inner `k` loop is a local accumulation
+- **Nested bounds:** variable
+- **Private vars:** `chunk_idx`, `i`, `j`, `k`, `i_global`, `j_global`, `sum`, `temp_top`, `temp_left`
+- **Arrays:** `a(RW)`, `temp_top(W, local scratch)`, `temp_left(W, local scratch)`, `sum(W, local scratch)`
+- **Issues:** scratch arrays, reduction-like inner accumulation, block-size constant
+
+## Summary Table
+| Function | Type | Priority | Parent | Iterations | Dependencies | Issues |
+|----------|------|----------|--------|------------|--------------|--------|
+| `lud_omp` offset loop | E | CRITICAL | none | `size / BS` | stage / recurrence | stage dependency, helper fragmentation risk |
+| `lud_diagonal_omp` | E | SECONDARY | line 37 | `BS` | recurrence | fixed small block, sequential helper |
+| `lud_omp` perimeter chunk loop | A | IMPORTANT | line 37 | `chunks_in_inter_row` | none at chunk level | scratch temp, inner reductions |
+| `lud_omp` interior chunk loop | A | CRITICAL | line 37 | `chunks_per_inter` | none at chunk level | scratch arrays, inner accumulation |
+
+## Structural Recommendations
+- **Natural offload unit:** fused routine
+- **Why:** `lud_omp` already has a staged block-LU shape; keeping `lud_diagonal_omp` and the chunk-update phases separate would create tiny device regions and extra host/device synchronization.
+- **Fragmentation risk:** high
+- **Would preserving helper boundaries likely create tiny kernels?** YES
+
+## Scalability Check
+- **Default input likely too small to guide optimization?** YES
+- **Small-input sensitive?** YES
+- **Expected scaling risks:** kernel count, host sync, transfer volume, launch overhead
+- **Larger practical profile size recommendation:** `2048`
+- **Why this size materially exercises the GPU:** it gives enough block count and cubic work to amortize launch overhead while keeping the matrix footprint modest and comfortably within memory limits
+
+## Data Details
+- **Dominant compute loop:** `lud_omp` offset loop
+- **Arrays swapped between functions?:** NO
+- **Scratch arrays?:** YES
+- **Mid-computation sync?:** YES
+- **RNG in timed loop?:** NO
+- **Preferred GPU pragma family:** `target teams distribute parallel for`
+
+[shell] $ /bin/bash -lc "cat /root/.codex/skills/paracodex/paracodex-serial-omp-step1/references/output.md && printf '\\n---EXAMPLES---\\n' && cat /root/.codex/skills/paracodex/paracodex-serial-omp-step1/references/examples.md"
+# Data Management Plan
+
+## Arrays Inventory
+List ALL arrays used in timed region:
+
+| Array Name | Size | Type | Init | Access |
+|------------|------|------|------|--------|
+| [name] | [bytes] | working/scratch/const/index | host/device | R/W/RO |
+
+**Types:** working (main data), scratch (temp), const (read-only), index (maps)
+
+## Functions in Timed Region
+| Function | Arrays Accessed | Frequency | Must Run On |
+|----------|----------------|-----------|-------------|
+| [name] | [list] | per-iteration/once | device/host |
+
+## Offload Unit Decision
+- **Chosen Offload Unit:** [single loop nest / fused routine / helper-by-helper]
+- **Why this unit:** [state why this is better than preserving the serial helper structure]
+- **Timed-region stage count if left unfused:** [count]
+- **Structural Risk:** [none / tiny outer parallelism / helper launch overhead / host-device sync]
+- **Required rewrite before pragmas?** [YES/NO]
+- **Combined GPU+mem budget:** [kernel + memcpy + sync]
+
+## Data Movement Strategy
+
+**Chosen Strategy:** [A/B/C]
+
+**Device Allocations (once):**
+```
+Strategy C: d_[array]: [size] via omp_target_alloc
+Strategy A: [arrays] in target data region
+```
+
+**Host→Device Transfers:**
+- When: [before iterations/once at start]
+- Arrays: [array1]→d_[array1] ([size] MB)
+- Total H→D: ~[X] MB
+
+**Device→Host Transfers:**
+- When: [after iterations/once at end]
+- Arrays: d_[array1]→[array1] ([size] MB)
+- Total D→H: ~[Y] MB
+
+**Transfers During Iterations:** [YES/NO]
+- If YES: [which arrays and why]
+- If NO: All data stays on device
+
+**Mid-computation sync in timed region:** [YES/NO]
+- If YES: [which `target update`, scalar staging, or host participation remains and why]
+- If NO: No host/device synchronization inside the hot path
+
+## Critical Checks (for chosen strategy)
+
+**Strategy A:**
+- [ ] Functions inside target data use `present,alloc` wrapper?
+- [ ] Scratch arrays use enter/exit data OR omp_target_alloc?
+- [ ] Chosen offload unit avoids avoidable tiny-kernel staging?
+
+**Strategy C:**
+- [ ] ALL functions in iteration loop use is_device_ptr?
+- [ ] Scratch arrays allocated on device (not host)?
+- [ ] No map() clauses (only is_device_ptr)?
+
+**Common Mistakes:**
+-  Some functions on device, others on host (causes copying)
+-  Scratch as host arrays in Strategy C
+-  Forgetting to offload ALL functions in loop
+-  Leaving generated placeholders such as `<RUN_ARGS>` in `Makefile.nvc` or scripts
+
+## Expected Transfer Volume
+- Total: ~[X+Y] MB for entire execution
+- **Red flag:** If actual >2x expected → data management wrong
+
+## Additional Parallelization Notes
+- **RNG Replicable?** [YES/NO] - If YES, use `#pragma omp declare target` on RNG function
+- **Outer Saturation?** [outer iters]
+- **Sparse Matrix NONZER?** [value]
+- **Histogram Strategy?** For small bin (≤ 100) counts: use per-thread local array + atomic merge (NO scratch arrays needed!)
+- **Kernel Granularity Check:** [good / too fragmented / must fuse]
+- **Preferred GPU pragma form:** [`target teams loop` / `target teams distribute parallel for` / other] - [why this compiler/runtime prefers it]
+
+## Scalability Check
+- **Default correctness size:** [value]
+- **Larger practical profiling size:** [value or rule]
+- **Why this size materially exercises the GPU:** [occupancy / kernel duration / transfer volume / enough parallel work / constrained by memory-time budget]
+- **Likely small-input sensitive?** [YES/NO]
+- **Scaling risk if this design is chosen:** [kernel count / transfer count / transfer volume / host sync / memory footprint / none]
+- **Chosen structure still plausible at larger size?** [YES/NO]
+
+**Summary:** [num] arrays ([num] scratch, [num] working), [num] functions, Strategy [A/B/C], offload unit [unit]. Expected: ~[X] MB H→D, ~[Y] MB D→H, [N] hot kernels/stages.
+
+## Build / Run Readiness
+- **Plain build command works?** [YES/NO]
+- **Plain `make -f Makefile.nvc run` works?** [YES/NO]
+- **Unresolved placeholders remaining?** [YES/NO]
+- **`{nsys_profile_cmd} > {profile_log_path} 2>&1` shows GPU kernels?** [YES/NO]
+
+---EXAMPLES---
+# Strategy Details
+
+## Structural Decision Rule
+
+Choose the offload unit before choosing pragmas:
+
+- If the timed region is a single large loop nest, preserve that loop nest and offload it directly.
+- If the timed region is split across multiple helper functions and one or more stages have tiny outer parallelism, fuse the full timed region into one GPU-oriented routine.
+- Prefer a fused routine when the helper-based design would create multiple kernels, `target update` operations, or host-visible scalar staging between steps.
+- Do not keep the serial helper structure unless it is already GPU-shaped.
+
+## STRATEGY A: target data Region
+
+**Map Clause Selection:**
+| Scenario | Map Clause | Why |
+|----------|------------|-----|
+| Device-init arrays (zero(), fill()) | `alloc` | Avoid copying garbage |
+| Host RNG init then sync | `alloc` + `update to` | Explicit sync after host init |
+| Read + modify + write | `tofrom` | Bidirectional |
+| Read-only | `to` | One-way |
+
+**Functions Called Inside target data:**
+Wrap with `present,alloc`/'to,tofrom', then choose the pragma form that gives the best GPU mapping:
+```c
+void compute(double *u, double *v, int n) {
+  #pragma omp target data map(present,alloc:u[0:n],v[0:n])
+  {
+    #pragma omp target teams loop
+    for (int i = 0; i < n; i++) { ... }
+  }
+}
+```
+
+Prefer `target teams loop` first for OpenMP 5+ offload, but keep or switch to `target teams distribute parallel for` when profiling or compiler behavior shows it maps the kernel better on the active toolchain.
+
+**RNG replicable:**
+```c
+#pragma omp target teams loop reduction(+:sum1, sum2) firstprivate(seed_base, params)
+for (int sample = 0; sample < N; ++sample) {
+  double rng_state = compute_seed_for_sample(sample);  // Per-thread seed
+  double local_hist[BINS] = {0};  // Per-thread histogram
+  
+  // Type E (RNG) is sequential WITHIN this thread
+  for (int i = 0; i < work_per_sample; ++i) {
+    double r = my_rng(&rng_state, A);
+    int bin = compute_bin(r);
+    local_hist[bin] += 1.0;
+    sum1 += ...; sum2 += ...;  // Reduction handles these
+  }
+  
+  // Atomic merge histogram at end
+  for (int b = 0; b < BINS; ++b) {
+    if (local_hist[b] != 0.0) {
+      #pragma omp atomic update
+      global_hist[b] += local_hist[b];
+    }
+  }
+}
+```
+
+**Scratch Arrays (two options):**
+
+- **Option 1: enter/exit data**
+```c
+double scratch[N];
+#pragma omp target enter data map(alloc:scratch[0:n])
+#pragma omp target data map(present,alloc:in[0:n])
+{
+  #pragma omp target teams loop
+  for (...) { /* use scratch */ }
+}
+#pragma omp target exit data map(delete:scratch[0:n])
+```
+
+- **Option 2: omp_target_alloc**
+```c
+double *scratch = (double*)omp_target_alloc(n*sizeof(double), 0);
+#pragma omp target data map(present,alloc:in[0:n])
+{
+  #pragma omp target teams loop is_device_ptr(scratch)
+  for (...) { ... }
+}
+omp_target_free(scratch, 0);
+```
+
+**Mid-computation sync:**
+```c
+#pragma omp target update from(result)
+host_compute(result);
+#pragma omp target update to(indices)
+```
+
+Avoid this pattern in the timed region unless the algorithm truly requires host participation between stages.
+
+## STRATEGY B: Asynchronous Offload
+Use when: Overlapping compute/transfer possible
+```c
+#pragma omp target teams loop nowait depend(out:x[0])
+for (i = 0; i < N; i++) { x[i] = init(i); }
+
+#pragma omp target teams loop nowait depend(in:x[0]) depend(out:y[0])
+for (i = 0; i < N; i++) { y[i] = compute(x[i]); }
+
+#pragma omp taskwait
+```
+
+## STRATEGY C: Global Device State (Iterative Solvers)
+Use omp_target_alloc + is_device_ptr for all device arrays.
+
+**Pattern:**
+```c
+// Device pointers: static double *d_arr
+allocate_device_arrays();  // omp_target_alloc once
+copy_to_device();          // omp_target_memcpy once
+
+for (iter ...) {
+  #pragma omp target teams is_device_ptr(d_arr1, d_arr2, ...)
+  {
+  #pragma omp loop            // Outer parallelism
+  for (k ...) {
+    #pragma omp loop          // Middle parallelism (if needed)
+    for (j ...) {
+      for (stage ...) { ... }  // NO pragma - stages must be serial!
+    }
+  }
+  }
+}
+
+free_device_arrays();
+```
+
+**Key Rules:**
+- Use `is_device_ptr` everywhere (no map clauses in hot path)
+- Reduction helpers (dot, norm) OK - they return scalars
+- stage loops: parallelize outer k,j; keep stage loop L serial
+- Iterative solvers: inline SpMV, updates in main loop
+
+---
+
+## Map Globals & Functions
+```c
+#pragma omp declare target
+double helper_func() { ... };
+#pragma omp end declare target
+
+#pragma omp declare target(global_var)
+```
+
+---
+
+## Parallelization patterns
+
+**Type A (Dense):**
+```c
+#pragma omp target teams loop collapse(2)
+for (i = 0; i < N; i++)
+  for (j = 0; j < M; j++) ...
+```
+Use `target teams distribute parallel for collapse(2)` instead when this compiler/runtime maps the dense iteration space better in practice.
+
+**Tiny staged kernel -> fuse first:**
+```c
+void train_kernel(state_t *s) {
+  float *x = s->x;
+  float *y = s->y;
+  float *w = s->w;
+
+  #pragma omp target data map(to:x[0:N], w[0:N*M]) map(tofrom:y[0:M])
+  {
+    #pragma omp target teams loop collapse(2)
+    for (int j = 0; j < M; ++j) {
+      for (int i = 0; i < N; ++i) {
+        // Forward/update logic that used to live in multiple helpers.
+      }
+    }
+  }
+}
+```
+Use this when the serial code has multiple helper calls but each helper exposes only small outer parallelism.
+
+**Type B (Sparse/CSR) - Nested Parallelism:**
+```c
+int tmp1, tmp2, tmp3;  // Function scope
+#pragma omp target teams loop is_device_ptr(...)
+for (int row = 0; row < nrows; row++) {
+  tmp1 = rowptr[row];
+  tmp2 = rowptr[row+1];
+  double sum = 0.0;
+  ***#pragma omp loop reduction(+:sum)***  // Parallelize inner *based on GPU saturation* 
+  for (int k = tmp1; k < tmp2; k++) {
+    tmp3 = colidx[k];
+    sum += A[k] * x[tmp3];
+  }
+  y[row] = sum;
+}
+```
+
+**Type C1 (Iterative Solvers) - Serial Inner:**
+```c
+#pragma omp target teams is_device_ptr(...)
+{
+#pragma omp loop collapse(2)
+  for (k = 0; k < K; k++) {
+    for (j = 0; j < J; j++) {
+      for (stage = 0; stage < S; stage++) { ... }  // No pragma - keep inner serial!
+    }
+  }
+}
+```
+**Rationale:** K×J teams already saturate GPU. Inner serial = better register reuse, no barriers.
+
+**Type C2 (Multigrid):** Wrap with `present,alloc`; each stencil call gets `target teams loop`.
+
+**Type C special rule:** Stage-dependent algorithms (multigrid, iterative stages) 
+should NEVER have inner parallelism, regardless of GPU. The barrier overhead between 
+stages exceeds any benefit from inner thread parallelism.
+
+**Type D (Histogram):** Add `#pragma omp atomic` on indirect writes.
+
+**Type F (Reduction):** `reduction(+:sum)`
+
+**Dense update with flattening and collapse:**
+```c
+const int stride = cols;
+#pragma omp target teams loop collapse(2)
+for (int j = 0; j < cols; ++j) {
+  for (int i = 0; i < rows; ++i) {
+    int idx = i * stride + j;
+    w[idx] += alpha * delta[j] * x[i];
+  }
+}
+```
+For pointer-to-pointer inputs, create contiguous storage first if that enables flat indexing and better GPU code generation.
+If profiling shows weaker mapping with `teams loop`, switch this pattern to `target teams distribute parallel for collapse(2)`.
+
+**Type G (Stencil):** `collapse(2)` on spatial dimensions.
+
+**Type A+E (Outer parallel, inner RNG):** 
+**When analysis says "RNG replicable: YES":**
+- Add `declare target` on RNG function - GPU callable.
+- Parallelize over samples, each thread has private RNG + histogram
+- Atomic merge histogram at the end
+
+## Histogram Optimization 
+If histogram bins ≤ 100:
+```c
+// GOOD: Per-thread local array (80 bytes for 10 bins)
+#pragma omp target teams loop reduction(+:sx, sy)
+for (int k = 0; k < N; ++k) {
+  double q_local[BINS] = {0};  // Thread-private
+  // ... accumulate into q_local ...
+  for (int b = 0; b < BINS; ++b) {
+    if (q_local[b] != 0.0) {
+      #pragma omp atomic update
+      q[b] += q_local[b];
+    }
+  }
+}
+```
+**DO NOT** create large scratch arrays for small histograms - the atomic overhead is negligible compared to memory transfer costs.
+**Key:** Each thread replicates the RNG state for its sample. Type E becomes parallelizable at the OUTER level.
+
+[shell] $ /bin/bash -lc "sed -n '220,520p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud_base.c && printf '\\n---COMMON-TAIL---\\n' && sed -n '220,520p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c"
+
+---COMMON-TAIL---
+      coe_i = 10*exp(lamda*i); 
+      j=size-1+i;     
+      coe[j]=coe_i;
+      j=size-1-i;     
+      coe[j]=coe_i;
+    }
+
+  m = (float*) malloc(sizeof(float)*size*size);
+  if ( m == NULL) {
+      return RET_FAILURE;
+  }
+
+  for (i=0; i < size; i++) {
+      for (j=0; j < size; j++) {
+	m[i*size+j]=coe[size-1-i+j];
+      }
+  }
+
+  *mp = m;
+
+  return RET_SUCCESS;
+}
+
+This is a classic staged dense LU: the recurrence is by block, but the trailing-block work is a regular 2D dense update. That points to a fused `target data` design with device-resident matrix state, and the main question is whether the block updates need helper offloads or a single GPU-oriented routine.
+[shell] $ /bin/bash -lc "find /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp -maxdepth 2 -type f \\( -name '*.dat' -o -name '*.txt' -o -name '*.in' \\) | sort"
+[shell] $ /bin/bash -lc "sed -n '1,240p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/Makefile.nvc | nl -ba"
+     1	# Makefile for lud-serial (omp version)
+     2	
+     3	#===============================================================================
+     4	# User Options
+     5	#===============================================================================
+     6	
+     7	# Compiler can be set below, or via environment variable
+     8	CC        = nvc++
+     9	OPTIMIZE  = yes
+    10	DEBUG     = no
+    11	DEVICE    = gpu
+    12	SM        = cc89
+    13	LAUNCHER  =
+    14	GATE_ROOT ?= $(abspath ../..)
+    15	REF_DIR   ?= $(GATE_ROOT)/golden_labels/src/lud-serial
+    16	REF_BIN   ?= $(REF_DIR)/main
+    17	REF_MAKE  ?= Makefile.nvc
+    18	VERIFY_CPPFLAGS ?= -DGATE_VERIFY
+    19	
+    20	RUN_ARGS ?= <RUN_ARGS>
+    21	
+    22	#===============================================================================
+    23	# Program name & source code list
+    24	#===============================================================================
+    25	
+    26	program = <PROGRAM_NAME>
+    27	
+    28	source = <SOURCE_FILES>
+    29	
+    30	obj = $(source:.cpp=.o)
+    31	
+    32	#===============================================================================
+    33	# Sets Flags
+    34	#===============================================================================
+    35	
+    36	# Standard Flags
+    37	CFLAGS := $(EXTRA_CFLAGS) -std=c++14 -Wall -I$(GATE_ROOT)/gate_sdk
+    38	LDFLAGS = 
+    39	
+    40	# Debug Flags
+    41	ifeq ($(DEBUG),yes)
+    42	  CFLAGS += -g -DDEBUG
+    43	  LDFLAGS  += -g
+    44	endif
+    45	
+    46	
+    47	# Optimization Flags
+    48	ifeq ($(OPTIMIZE),yes)
+    49	  CFLAGS += -O3
+    50	endif
+    51	
+    52	ifeq ($(DEVICE),gpu)
+    53	  CFLAGS +=-Minfo -mp=gpu -gpu=$(SM)
+    54	else
+    55	  CFLAGS +=-qopenmp
+    56	endif
+    57	#===============================================================================
+    58	# Targets to Build
+    59	#===============================================================================
+    60	
+    61	$(program): $(obj)
+    62		$(CC) $(CFLAGS) $(obj) -o $@ $(LDFLAGS)
+    63	
+    64	%.o: %.cpp
+    65		$(CC) $(CFLAGS) -c $< -o $@
+    66	
+    67	clean:
+    68		rm -rf $(program) $(obj)
+    69	
+    70	run: $(program)
+    71		$(LAUNCHER) ./$(program) $(RUN_ARGS)
+    72	
+    73	.PHONY: ref_build
+    74	ref_build:
+    75		$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) clean
+    76		$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) CC="$(CC)" OPTIMIZE="$(OPTIMIZE)" DEBUG="$(DEBUG)" DEVICE="$(DEVICE)" SM="$(SM)" CFLAGS="$(CFLAGS) -I$(GATE_ROOT)/gate_sdk"
+    77	
+    78	.PHONY: verify_build
+    79	verify_build:
+    80		$(MAKE) -f Makefile.nvc clean
+    81		$(MAKE) -f Makefile.nvc EXTRA_CFLAGS="$(VERIFY_CPPFLAGS) $(EXTRA_CFLAGS)"
+    82	
+    83	.PHONY: ref_verify_build
+    84	ref_verify_build:
+    85		$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) clean
+    86		$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) CC="$(CC)" OPTIMIZE="$(OPTIMIZE)" DEBUG="$(DEBUG)" DEVICE="$(DEVICE)" SM="$(SM)" CFLAGS="$(VERIFY_CPPFLAGS) $(CFLAGS) -I$(GATE_ROOT)/gate_sdk"
+    87	
+    88	.PHONY: check-correctness
+    89	check-correctness: verify_build ref_verify_build
+    90		OMP_TARGET_OFFLOAD=MANDATORY python3 $(GATE_ROOT)/gate_sdk/scripts/gate_harness.py $(REF_BIN) ./$(program) $(RUN_ARGS)
+
+[shell] $ /bin/bash -lc "rg -n \"OMP_TARGET_OFFLOAD|run:|input|size=|create_matrix|gen_input\" /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp -g '"'!*.bak'"'"
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:32:  {"input", 1, NULL, 'i'},
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:47:  const char *input_file = NULL;
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:56:      input_file = optarg;
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:66:      printf("Generate input matrix internally, size =%d\n", matrix_dim);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:68:      // fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n", argv[0]);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:78:      fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n",
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:85:    fprintf(stderr, "Usage: %s [-v] [-n no. of threads] [-s matrix_size|-i input_file]\n", argv[0]);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:89:  if (input_file) {
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:90:    printf("Reading matrix from file %s\n", input_file);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:91:    ret = create_matrix_from_file(&m, input_file, &matrix_dim);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:94:      fprintf(stderr, "error create matrix from file %s\n", input_file);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:99:    printf("Creating matrix internally size=%d\n", matrix_dim);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:100:    ret = create_matrix(&m, matrix_dim);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:103:      fprintf(stderr, "error create matrix internally size=%d\n", matrix_dim);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c:109:    printf("No input file specified!\n");
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c:31:      {"input", 1, NULL, 'i'},
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c:46:  const char *input_file = NULL;
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c:54:          input_file = optarg;
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c:62:          fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n", argv[0]);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c:71:          fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n",
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c:78:      fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n", argv[0]);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c:82:  if (input_file) {
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c:83:      printf("Reading matrix from file %s\n", input_file);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c:84:      ret = create_matrix_from_file(&m, input_file, &matrix_dim);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c:87:          fprintf(stderr, "error create matrix from file %s\n", input_file);
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c:91:    printf("No input file specified!\n");
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/analysis.md:72:- **Default input likely too small to guide optimization?** YES
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/analysis.md:73:- **Small-input sensitive?** YES
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/Makefile.nvc:70:run: $(program)
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/Makefile.nvc:90:	OMP_TARGET_OFFLOAD=MANDATORY python3 $(GATE_ROOT)/gate_sdk/scripts/gate_harness.py $(REF_BIN) ./$(program) $(RUN_ARGS)
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/tools/gen_input.c:21:        printf("./gen_input [Matrix_Dimension_size]\n");
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c:41:create_matrix_from_file(float **mp, const char* filename, int *size_p){
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c:75:create_matrix_from_random(float **mp, int size){
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c:129:matrix_multiply(float *inputa, float *inputb, float *output, int size){
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c:135:        output[i*size+j] = inputa[i*size+k] * inputb[k*size+j];
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c:172:  /* printf(">>>>>input<<<<<<<\n"); */
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c:211:create_matrix(float **mp, int size){
+
+I’ve narrowed the first implementation to a device-resident matrix with three offloaded phases per block: diagonal factorization, perimeter updates, and interior updates. I’m checking the headers now because the Makefile fix and any OpenMP runtime calls need the right includes for NVHPC to compile cleanly on the first build.
+[shell] $ /bin/bash -lc "sed -n '1,240p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.h"
+sed: can't read /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.h: No such file or directory
+
+[shell] $ /bin/bash -lc "sed -n '1,220p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c | nl -ba && printf '\\n---\\n' && sed -n '1,220p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c | nl -ba"
+     1	/*
+     2	 * =====================================================================================
+     3	 *
+     4	 *       Filename:  suite.c
+     5	 *
+     6	 *    Description:  The main wrapper for the suite
+     7	 *
+     8	 *        Version:  1.0
+     9	 *        Created:  10/22/2009 08:40:34 PM
+    10	 *       Revision:  none
+    11	 *       Compiler:  gcc
+    12	 *
+    13	 *         Author:  Liang Wang (lw2aw), lw2aw@virginia.edu
+    14	 *        Company:  CS@UVa
+    15	 *
+    16	 * =====================================================================================
+    17	 */
+    18	
+    19	#include <stdio.h>
+    20	#include <unistd.h>
+    21	#include <getopt.h>
+    22	#include <stdlib.h>
+    23	#include <assert.h>
+    24	
+    25	#include "common.h"
+    26	
+    27	static int do_verify = 0;
+    28	
+    29	static struct option long_options[] = {
+    30	      /* name, has_arg, flag, val */
+    31	      {"input", 1, NULL, 'i'},
+    32	      {"size", 1, NULL, 's'},
+    33	      {"verify", 0, NULL, 'v'},
+    34	      {0,0,0,0}
+    35	};
+    36	
+    37	extern void
+    38	lud_base(float *m, int matrix_dim);
+    39	
+    40	int
+    41	main ( int argc, char *argv[] )
+    42	{
+    43	  int matrix_dim = 32; /* default matrix_dim */
+    44	  int opt, option_index=0;
+    45	  func_ret_t ret;
+    46	  const char *input_file = NULL;
+    47	  float *m, *mm;
+    48	  stopwatch sw;
+    49	
+    50	  while ((opt = getopt_long(argc, argv, "::vs:i:", 
+    51	                            long_options, &option_index)) != -1 ) {
+    52	      switch(opt){
+    53	        case 'i':
+    54	          input_file = optarg;
+    55	          break;
+    56	        case 'v':
+    57	          do_verify = 1;
+    58	          break;
+    59	        case 's':
+    60	          matrix_dim = atoi(optarg);
+    61	          fprintf(stderr, "Currently not supported, use -i instead\n");
+    62	          fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n", argv[0]);
+    63	          exit(EXIT_FAILURE);
+    64	        case '?':
+    65	          fprintf(stderr, "invalid option\n");
+    66	          break;
+    67	        case ':':
+    68	          fprintf(stderr, "missing argument\n");
+    69	          break;
+    70	        default:
+    71	          fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n",
+    72	                  argv[0]);
+    73	          exit(EXIT_FAILURE);
+    74	      }
+    75	  }
+    76	
+    77	  if ( (optind < argc) || (optind == 1)) {
+    78	      fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n", argv[0]);
+    79	      exit(EXIT_FAILURE);
+    80	  }
+    81	  
+    82	  if (input_file) {
+    83	      printf("Reading matrix from file %s\n", input_file);
+    84	      ret = create_matrix_from_file(&m, input_file, &matrix_dim);
+    85	      if (ret != RET_SUCCESS) {
+    86	          m = NULL;
+    87	          fprintf(stderr, "error create matrix from file %s\n", input_file);
+    88	          exit(EXIT_FAILURE);
+    89	      }
+    90	  } else {
+    91	    printf("No input file specified!\n");
+    92	    exit(EXIT_FAILURE);
+    93	  } 
+    94	
+    95	  if (do_verify){
+    96	    printf("Before LUD\n");
+    97	    print_matrix(m, matrix_dim);
+    98	    matrix_duplicate(m, &mm, matrix_dim);
+    99	  }
+   100	
+   101	  stopwatch_start(&sw);
+   102	  lud_base(m, matrix_dim);
+   103	  stopwatch_stop(&sw);
+   104	  printf("Time consumed(ms): %lf\n", 1000*get_interval_by_sec(&sw));
+   105	
+   106	  if (do_verify){
+   107	    printf("After LUD\n");
+   108	    print_matrix(m, matrix_dim);
+   109	    printf(">>>Verify<<<<\n");
+   110	    lud_verify(mm, m, matrix_dim); 
+   111	    free(mm);
+   112	  }
+   113	
+   114	  free(m);
+   115	
+   116	  return EXIT_SUCCESS;
+   117	}				/* ----------  end of function main  ---------- */
+
+---
+     1	/*
+     2	 * =====================================================================================
+     3	 *
+     4	 *       Filename:  suite.c
+     5	 *
+     6	 *    Description:  The main wrapper for the suite
+     7	 *
+     8	 *        Version:  1.0
+     9	 *        Created:  10/22/2009 08:40:34 PM
+    10	 *       Revision:  none
+    11	 *       Compiler:  gcc
+    12	 *
+    13	 *         Author:  Liang Wang (lw2aw), lw2aw@virginia.edu
+    14	 *        Company:  CS@UVa
+    15	 *
+    16	 * =====================================================================================
+    17	 */
+    18	
+    19	#include <stdio.h>
+    20	#include <unistd.h>
+    21	#include <getopt.h>
+    22	#include <stdlib.h>
+    23	#include <assert.h>
+    24	
+    25	#include "common.h"
+    26	
+    27	static int do_verify = 0;
+    28	int omp_num_threads = 40;
+    29	
+    30	static struct option long_options[] = {
+    31	  /* name, has_arg, flag, val */
+    32	  {"input", 1, NULL, 'i'},
+    33	  {"size", 1, NULL, 's'},
+    34	  {"verify", 0, NULL, 'v'},
+    35	  {0,0,0,0}
+    36	};
+    37	
+    38	extern void
+    39	lud_omp(float *m, int matrix_dim);
+    40	
+    41	int
+    42	main ( int argc, char *argv[] )
+    43	{
+    44	  int matrix_dim = 32; /* default size */
+    45	  int opt, option_index=0;
+    46	  func_ret_t ret;
+    47	  const char *input_file = NULL;
+    48	  float *m, *mm;
+    49	  stopwatch sw;
+    50	
+    51		
+    52	  while ((opt = getopt_long(argc, argv, "::vs:n:i:", 
+    53	                            long_options, &option_index)) != -1 ) {
+    54	    switch(opt){
+    55	    case 'i':
+    56	      input_file = optarg;
+    57	      break;
+    58	    case 'v':
+    59	      do_verify = 1;
+    60	      break;
+    61	    case 'n':
+    62	      omp_num_threads = atoi(optarg);
+    63	      break;
+    64	    case 's':
+    65	      matrix_dim = atoi(optarg);
+    66	      printf("Generate input matrix internally, size =%d\n", matrix_dim);
+    67	      // fprintf(stderr, "Currently not supported, use -i instead\n");
+    68	      // fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n", argv[0]);
+    69	      // exit(EXIT_FAILURE);
+    70	      break;
+    71	    case '?':
+    72	      fprintf(stderr, "invalid option\n");
+    73	      break;
+    74	    case ':':
+    75	      fprintf(stderr, "missing argument\n");
+    76	      break;
+    77	    default:
+    78	      fprintf(stderr, "Usage: %s [-v] [-s matrix_size|-i input_file]\n",
+    79		      argv[0]);
+    80	      exit(EXIT_FAILURE);
+    81	    }
+    82	  }
+    83	  
+    84	  if ( (optind < argc) || (optind == 1)) {
+    85	    fprintf(stderr, "Usage: %s [-v] [-n no. of threads] [-s matrix_size|-i input_file]\n", argv[0]);
+    86	    exit(EXIT_FAILURE);
+    87	  }
+    88	
+    89	  if (input_file) {
+    90	    printf("Reading matrix from file %s\n", input_file);
+    91	    ret = create_matrix_from_file(&m, input_file, &matrix_dim);
+    92	    if (ret != RET_SUCCESS) {
+    93	      m = NULL;
+    94	      fprintf(stderr, "error create matrix from file %s\n", input_file);
+    95	      exit(EXIT_FAILURE);
+    96	    }
+    97	  }
+    98	  else if (matrix_dim) {
+    99	    printf("Creating matrix internally size=%d\n", matrix_dim);
+   100	    ret = create_matrix(&m, matrix_dim);
+   101	    if (ret != RET_SUCCESS) {
+   102	      m = NULL;
+   103	      fprintf(stderr, "error create matrix internally size=%d\n", matrix_dim);
+   104	      exit(EXIT_FAILURE);
+   105	    }
+   106	  }
+   107	 
+   108	  else {
+   109	    printf("No input file specified!\n");
+   110	    exit(EXIT_FAILURE);
+   111	  } 
+   112	
+   113	  if (do_verify){
+   114	    printf("Before LUD\n");
+   115	    /* print_matrix(m, matrix_dim); */
+   116	    matrix_duplicate(m, &mm, matrix_dim);
+   117	  }
+   118	
+   119	
+   120	  stopwatch_start(&sw);
+   121	  lud_omp(m, matrix_dim);
+   122	  stopwatch_stop(&sw);
+   123	  printf("Time consumed(ms): %lf\n", 1000*get_interval_by_sec(&sw));
+   124	
+   125	  if (do_verify){
+   126	    printf("After LUD\n");
+   127	    /* print_matrix(m, matrix_dim); */
+   128	    printf(">>>Verify<<<<\n");
+   129	    lud_verify(mm, m, matrix_dim); 
+   130	    free(mm);
+   131	  }
+   132	  
+   133	  free(m);
+   134	
+   135	  return EXIT_SUCCESS;
+   136	}				/* ----------  end of function main  ---------- */
+
+[shell] $ /bin/bash -lc "rg --files /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp | rg 'common\\.h"'$|Makefile|lud_omp'"\\.c"'$|lud'"\\.c"'$|lud_base'"\\.c"'$'"'"
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud_omp.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/base/lud_base.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/Makefile.nvc
+
+[shell] $ /bin/bash -lc 'find /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118 -name common.h | head'
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common/common.h
+
+The tree doesn’t ship `common.h` locally, so the build has to point at the golden-label support headers. I’m checking that header now so I can set the include path and any runtime declarations correctly instead of guessing the wrong path.
+[shell] $ /bin/bash -lc "sed -n '1,260p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common/common.h"
+#ifndef _COMMON_H
+#define _COMMON_H
+
+#include <time.h>
+#include <sys/time.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+
+#define GET_RAND_FP ( (float)rand() /   \
+                     ((float)(RAND_MAX)+(float)(1)) )
+
+#define MIN(i,j) ((i)<(j) ? (i) : (j))
+
+typedef enum _FUNC_RETURN_CODE {
+    RET_SUCCESS,
+    RET_FAILURE
+}func_ret_t;
+
+typedef struct __stopwatch_t{
+    struct timeval begin;
+    struct timeval end;
+}stopwatch;
+
+void 
+stopwatch_start(stopwatch *sw);
+
+void 
+stopwatch_stop (stopwatch *sw);
+
+double 
+get_interval_by_sec(stopwatch *sw);
+
+int 
+get_interval_by_usec(stopwatch *sw);
+
+func_ret_t
+create_matrix_from_file(float **mp, const char *filename, int *size_p);
+
+func_ret_t
+create_matrix_from_random(float **mp, int size);
+
+func_ret_t
+create_matrix(float **mp, int size);
+
+func_ret_t
+lud_verify(float *m, float *lu, int size);
+
+void
+matrix_multiply(float *inputa, float *inputb, float *output, int size);
+
+void
+matrix_duplicate(float *src, float **dst, int matrix_dim);
+
+void
+print_matrix(float *mm, int matrix_dim);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+[shell] $ /bin/bash -lc "find /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial -maxdepth 2 -type f | sort | sed -n '1,120p'"
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/Makefile
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/README
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/base/Makefile
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/base/lud.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/base/lud_base.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common copy/common.mk
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common copy/make.config
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common/common.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common/common.h
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common/common.o
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/omp/Makefile
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/omp/Makefile.offload
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/omp/lud.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/omp/lud.o
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/omp/lud_omp.c
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/omp/lud_omp.o
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/run
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/run_offload
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/tools/Makefile
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/tools/README
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/tools/gen_input.c
+
+[shell] $ /bin/bash -lc "sed -n '1,260p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/omp/lud_omp.c"
+#include <stdio.h>
+
+#define BS 16
+
+#define AA(_i,_j) a[offset*size+_i*size+_j+offset]
+#define BB(_i,_j) a[_i*size+_j]
+
+void lud_diagonal_omp (float* a, int size, int offset)
+{
+    int i, j, k;
+    for (i = 0; i < BS; i++) {
+
+        for (j = i; j < BS; j++) {
+            for (k = 0; k < i ; k++) {
+                AA(i,j) = AA(i,j) - AA(i,k) * AA(k,j);
+            }
+        }
+
+        float temp = 1.f/AA(i,i);
+        for (j = i+1; j < BS; j++) {
+            for (k = 0; k < i ; k++) {
+                AA(j,i) = AA(j,i) - AA(j,k) * AA(k,i);
+            }
+            AA(j,i) = AA(j,i)*temp;
+        }
+    }
+
+}
+
+
+// implements block LU factorization
+void lud_omp(float *a, int size)
+{
+    int offset, chunk_idx, size_inter, chunks_in_inter_row, chunks_per_inter;
+
+    printf("running serial\n");
+    for (offset = 0; offset < size - BS ; offset += BS)
+    {
+        // lu factorization of left-top corner block diagonal matrix
+        lud_diagonal_omp(a, size, offset);
+
+        size_inter = size - offset -  BS;
+        chunks_in_inter_row  = size_inter/BS;
+
+        // calculate perimeter block matrices
+        for ( chunk_idx = 0; chunk_idx < chunks_in_inter_row; chunk_idx++)
+        {
+            int i, j, k, i_global, j_global, i_here, j_here;
+            float sum;
+            float temp[BS*BS] __attribute__ ((aligned (64)));
+
+            for (i = 0; i < BS; i++) {
+                for (j =0; j < BS; j++){
+                    temp[i*BS + j] = a[size*(i + offset) + offset + j ];
+                }
+            }
+            i_global = offset;
+            j_global = offset;
+
+            // processing top perimeter
+            j_global += BS * (chunk_idx+1);
+            for (j = 0; j < BS; j++) {
+                for (i = 0; i < BS; i++) {
+                    sum = 0.f;
+                    for (k=0; k < i; k++) {
+                        sum += temp[BS*i +k] * BB((i_global+k),(j_global+j));
+                    }
+                    i_here = i_global + i;
+                    j_here = j_global + j;
+                    BB(i_here, j_here) = BB(i_here,j_here) - sum;
+                }
+            }
+
+            // processing left perimeter
+            j_global = offset;
+            i_global += BS * (chunk_idx + 1);
+            for (i = 0; i < BS; i++) {
+                for (j = 0; j < BS; j++) {
+                    sum = 0.f;
+                    for (k=0; k < j; k++) {
+                        sum += BB((i_global+i),(j_global+k)) * temp[BS*k + j];
+                    }
+                    i_here = i_global + i;
+                    j_here = j_global + j;
+                    a[size*i_here + j_here] = ( a[size*i_here+j_here] - sum ) / a[size*(offset+j) + offset+j];
+                }
+            }
+
+        }
+
+        // update interior block matrices
+        chunks_per_inter = chunks_in_inter_row*chunks_in_inter_row;
+
+        for  (chunk_idx =0; chunk_idx < chunks_per_inter; chunk_idx++)
+        {
+            int i, j, k, i_global, j_global;
+            float temp_top[BS*BS] __attribute__ ((aligned (64)));
+            float temp_left[BS*BS] __attribute__ ((aligned (64)));
+            float sum[BS] __attribute__ ((aligned (64))) = {0.f};
+
+            i_global = offset + BS * (1 +  chunk_idx/chunks_in_inter_row);
+            j_global = offset + BS * (1 + chunk_idx%chunks_in_inter_row);
+
+            for (i = 0; i < BS; i++) {
+                for (j =0; j < BS; j++){
+                    temp_top[i*BS + j]  = a[size*(i + offset) + j + j_global ];
+                    temp_left[i*BS + j] = a[size*(i + i_global) + offset + j];
+                }
+            }
+
+            for (i = 0; i < BS; i++)
+            {
+                for (k=0; k < BS; k++) {
+                    for (j = 0; j < BS; j++) {
+                        sum[j] += temp_left[BS*i + k] * temp_top[BS*k + j];
+                    }
+                }
+                for (j = 0; j < BS; j++) {
+                    BB((i+i_global),(j+j_global)) -= sum[j];
+                    sum[j] = 0.f;
+                }
+            }
+        }
+    }
+
+    lud_diagonal_omp(a, size, offset);
+}
+
+[shell] $ /bin/bash -lc "sed -n '1,220p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/omp/Makefile && printf '\\n---OFFLOAD---\\n' && sed -n '1,220p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/omp/Makefile.offload"
+# Makefile for LU Decomposition
+#
+#
+
+# DEBUG can be set to YES to include debugging info, or NO otherwise
+DEBUG          := NO
+
+# PROFILE can be set to YES to include profiling info, or NO otherwise
+PROFILE        := NO
+
+# ------------  name of the executable  ----------------------------------------
+EXECUTABLE      := lud_omp
+
+# ------------  list of all source files  --------------------------------------
+SOURCES         := lud.c lud_omp.c ../common/common.c 
+
+# ------------  compiler  ------------------------------------------------------
+CC              := gcc
+CXX             := g++
+
+# ------------  compiler flags  ------------------------------------------------
+DEBUG_CFLAGS    := -Wall -O0 -g
+RELEASE_CFLAGS  := -Wall -O3 
+COMMON_CFLAGS   :=
+
+# ------------  compiler defs  ------------------------------------------------
+DEBUG_CDEFS    := 
+RELEASE_CDEFS  := 
+COMMON_CDEFS   := 
+
+# ------------  linker flags  --------------------------------------------------
+DEBUG_LDFLAGS    := -g
+RELEASE_LDFLAGS  := 
+COMMON_LDFLAGS   :=
+
+ifeq (YES, ${DEBUG})
+  CFLAGS       := ${DEBUG_CFLAGS} ${DEBUG_CDEFS}
+  CXXFLAGS     := ${DEBUG_CXXFLAGS} ${DEBUG_CDEFS}
+  LDFLAGS      := ${DEBUG_LDFLAGS}
+else
+  CFLAGS       := ${RELEASE_CFLAGS} ${RELEASE_CDEFS}
+  CXXFLAGS     := ${RELEASE_CXXFLAGS} ${RELEASE_CDEFS}
+  LDFLAGS      := ${RELEASE_LDFLAGS}
+endif
+
+CFLAGS         := ${CFLAGS} ${COMMON_CFLAGS}
+CXXFLAGS       := ${CXXFLAGS} ${COMMON_CFLAGS}
+LDFLAGS        := ${LDFLAGS} ${COMMON_LDFLAGS}
+
+ifeq (YES, ${PROFILE})
+  CFLAGS       := ${CFLAGS}   -pg -O3
+  CXXFLAGS     := ${CXXFLAGS} -pg -O3
+  LDFLAGS      := ${LDFLAGS}  -pg
+endif
+
+# ------------  additional system include directories  -------------------------
+GLOBAL_INC_DIR  =
+
+# ------------  private include directories  -----------------------------------
+LOCAL_INC_DIR   = ../common
+
+# ------------  system libraries  (e.g. -lm )  ---------------------------------
+SYS_LIBS        = -lm
+
+# ------------  additional system library directories  -------------------------
+GLOBAL_LIB_DIR  =
+
+# ------------  additional system libraries  -----------------------------------
+GLOBAL_LIBS     =
+
+# ------------  private library directories  -----------------------------------
+LOCAL_LIB_DIR   = 
+
+# ------------  private libraries  (e.g. libxyz.a )  ---------------------------
+LOCAL_LIBS      =
+
+
+C_SOURCES       = $(filter     %.c, $(SOURCES))
+CPP_SOURCES     = $(filter-out %.c, $(SOURCES))
+ALL_INC_DIR     = $(addprefix -I, $(LOCAL_INC_DIR) $(GLOBAL_INC_DIR))
+ALL_LIB_DIR     = $(addprefix -L, $(LOCAL_LIB_DIR) $(GLOBAL_LIB_DIR))
+GLOBAL_LIBSS    = $(addprefix $(GLOBAL_LIB_DIR)/, $(GLOBAL_LIBS))
+LOCAL_LIBSS     = $(addprefix $(LOCAL_LIB_DIR)/, $(LOCAL_LIBS))
+ALL_CFLAGS      = $(CFLAGS) $(ALL_INC_DIR)
+ALL_LFLAGS      = $(LDFLAGS) $(ALL_LIB_DIR)
+BASENAMES       = $(basename $(SOURCES))
+
+# ------------  generate the names of the object files  ------------------------
+OBJECTS         = $(addsuffix .o,$(BASENAMES))
+ 
+# ------------  make the executable (the default goal)  ------------------------
+$(EXECUTABLE):	$(OBJECTS)
+ifeq ($(strip $(CPP_SOURCES)),)
+	$(CC)  $(ALL_LFLAGS) -o $(EXECUTABLE) $(OBJECTS) $(LOCAL_LIBSS) $(GLOBAL_LIBSS) $(SYS_LIBS)
+else
+	$(CXX) $(ALL_LFLAGS) -o $(EXECUTABLE) $(OBJECTS) $(LOCAL_LIBSS) $(GLOBAL_LIBSS) $(SYS_LIBS)
+endif
+
+# ------------  make the objects  ----------------------------------------------
+%.o:		%.c
+				$(CC)  -c $(ALL_CFLAGS) $< -o $@
+
+%.o:		%.cc
+				$(CXX) -c $(ALL_CFLAGS) $< -o $@
+
+%.o:		%.cpp
+				$(CXX) -c $(ALL_CFLAGS) $< -o $@
+
+%.o:		%.C
+				$(CXX) -c $(ALL_CFLAGS) $< -o $@
+
+clean:
+	-rm --force $(EXECUTABLE) $(OBJECTS) *~
+
+.PHONY: clean
+
+# ==============================================================================
+# vim: set tabstop=2: set shiftwidth=2:
+
+---OFFLOAD---
+# Makefile for LU Decomposition
+#
+#
+
+# DEBUG can be set to YES to include debugging info, or NO otherwise
+DEBUG          := NO
+
+# PROFILE can be set to YES to include profiling info, or NO otherwise
+PROFILE        := NO
+
+# ------------  name of the executable  ----------------------------------------
+EXECUTABLE      := lud_omp_offload
+
+# ------------  list of all source files  --------------------------------------
+SOURCES         := lud.c lud_omp.c ../common/common.c 
+
+# ------------  compiler  ------------------------------------------------------
+CC              := icc
+CXX             := icc
+
+# ------------  compiler flags  ------------------------------------------------  -qopt-gather-scatter-unroll=7
+DEBUG_CFLAGS    := -Wall -O0 -g
+RELEASE_CFLAGS  := -Wall -O3 -g -fp-model fast=2 -fma -offload-option,mic,compiler,"-no-opt-prefetch"
+COMMON_CFLAGS   := -fopenmp
+
+# ------------  compiler defs  ------------------------------------------------
+DEBUG_CDEFS    := -DOMP_OFFLOAD 
+RELEASE_CDEFS  := -DOMP_OFFLOAD
+COMMON_CDEFS   := 
+
+# ------------  linker flags  --------------------------------------------------
+DEBUG_LDFLAGS    := -g
+RELEASE_LDFLAGS  := 
+COMMON_LDFLAGS   := -fopenmp
+
+ifeq (YES, ${DEBUG})
+  CFLAGS       := ${DEBUG_CFLAGS} ${DEBUG_CDEFS}
+  CXXFLAGS     := ${DEBUG_CXXFLAGS} ${DEBUG_CDEFS}
+  LDFLAGS      := ${DEBUG_LDFLAGS}
+else
+  CFLAGS       := ${RELEASE_CFLAGS} ${RELEASE_CDEFS}
+  CXXFLAGS     := ${RELEASE_CXXFLAGS} ${RELEASE_CDEFS}
+  LDFLAGS      := ${RELEASE_LDFLAGS}
+endif
+
+CFLAGS         := ${CFLAGS} ${COMMON_CFLAGS}
+CXXFLAGS       := ${CXXFLAGS} ${COMMON_CFLAGS}
+LDFLAGS        := ${LDFLAGS} ${COMMON_LDFLAGS}
+
+ifeq (YES, ${PROFILE})
+  CFLAGS       := ${CFLAGS}   -pg -O3
+  CXXFLAGS     := ${CXXFLAGS} -pg -O3
+  LDFLAGS      := ${LDFLAGS}  -pg
+endif
+
+# ------------  additional system include directories  -------------------------
+GLOBAL_INC_DIR  =
+
+# ------------  private include directories  -----------------------------------
+LOCAL_INC_DIR   = ../common
+
+# ------------  system libraries  (e.g. -lm )  ---------------------------------
+SYS_LIBS        = -lm
+
+# ------------  additional system library directories  -------------------------
+GLOBAL_LIB_DIR  =
+
+# ------------  additional system libraries  -----------------------------------
+GLOBAL_LIBS     =
+
+# ------------  private library directories  -----------------------------------
+LOCAL_LIB_DIR   = 
+
+# ------------  private libraries  (e.g. libxyz.a )  ---------------------------
+LOCAL_LIBS      =
+
+
+C_SOURCES       = $(filter     %.c, $(SOURCES))
+CPP_SOURCES     = $(filter-out %.c, $(SOURCES))
+ALL_INC_DIR     = $(addprefix -I, $(LOCAL_INC_DIR) $(GLOBAL_INC_DIR))
+ALL_LIB_DIR     = $(addprefix -L, $(LOCAL_LIB_DIR) $(GLOBAL_LIB_DIR))
+GLOBAL_LIBSS    = $(addprefix $(GLOBAL_LIB_DIR)/, $(GLOBAL_LIBS))
+LOCAL_LIBSS     = $(addprefix $(LOCAL_LIB_DIR)/, $(LOCAL_LIBS))
+ALL_CFLAGS      = $(CFLAGS) $(ALL_INC_DIR)
+ALL_LFLAGS      = $(LDFLAGS) $(ALL_LIB_DIR)
+BASENAMES       = $(basename $(SOURCES))
+
+# ------------  generate the names of the object files  ------------------------
+OBJECTS         = $(addsuffix .o,$(BASENAMES))
+
+# ------------  make the executable (the default goal)  ------------------------
+$(EXECUTABLE):	$(OBJECTS)
+ifeq ($(strip $(CPP_SOURCES)),)
+	$(CC)  $(ALL_LFLAGS) -o $(EXECUTABLE) $(OBJECTS) $(LOCAL_LIBSS) $(GLOBAL_LIBSS) $(SYS_LIBS)
+else
+	$(CXX) $(ALL_LFLAGS) -o $(EXECUTABLE) $(OBJECTS) $(LOCAL_LIBSS) $(GLOBAL_LIBSS) $(SYS_LIBS)
+endif
+
+# ------------  make the objects  ----------------------------------------------
+%.o:		%.c
+				$(CC)  -c $(ALL_CFLAGS) $< -o $@
+
+%.o:		%.cc
+				$(CXX) -c $(ALL_CFLAGS) $< -o $@
+
+%.o:		%.cpp
+				$(CXX) -c $(ALL_CFLAGS) $< -o $@
+
+%.o:		%.C
+				$(CXX) -c $(ALL_CFLAGS) $< -o $@
+
+clean:
+	-rm --force $(EXECUTABLE) $(OBJECTS) *~
+
+.PHONY: clean
+
+# ==============================================================================
+# vim: set tabstop=2: set shiftwidth=2:
+
+I’ve got enough context to write the plan now. After that I’ll do the baseline build/run against the untouched sources, then I’ll switch into the GPU implementation and Makefile cleanup.
+[file_add] /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/data_plan.md
+I’ve written the plan. Next is the actual baseline run against the untouched sources so I have a concrete before/after result before I start changing the compute path.
+[shell] $ /bin/bash -lc 'which nvc || true; which nvc++ || true'
+/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/bin/nvc
+/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/bin/nvc++
+
+[shell] $ /bin/bash -lc 'rm -f /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/baseline_output.txt /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/baseline_lud_omp'
+[shell] $ /bin/bash -lc '/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/bin/nvc -O3 -Wall -I/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common -mp=gpu -gpu=cc89 /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud.c /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud_omp.c /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c -o /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/baseline_lud_omp'
+/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c:
+"/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/common/common.c", line 187: warning: missing return statement at end of non-void function "lud_verify" [implicit_return_from_non_void_function]
+  }
+  ^
+
+Remark: individual warnings can be suppressed with "--diag_suppress <warning-name>"
+
+
+[shell] $ /bin/bash -lc 'cd /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp && env OMP_TARGET_OFFLOAD=MANDATORY ./baseline_lud_omp -s 32 -v > baseline_output.txt 2>&1 && grep -E "Verification|SUCCESSFUL|FAILED|>>>Verify<<<<|dismatch|Time consumed" baseline_output.txt'
+Time consumed(ms): 0.011000
+>>>Verify<<<<
+
+I’m making the actual code change now: one device-resident `target data` region in the OMP path, scalar device diagonal factorization, and parallel chunk kernels for the independent perimeter/interior block updates. I’m also fixing the NVHPC Makefile to compile the `.c` sources and point at the right `common.h`.
+[file_update] /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/Makefile.nvc
+[file_update] /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud_omp.c
+The first patch is in. I need one cleanup pass on the helper annotations because device-callable wrappers have to be marked on the actual functions, not just on thin wrappers that call host-only helpers. After that I’ll build and shake out any NVHPC syntax issues.
+[file_update] /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud_omp.c
+[shell] $ /bin/bash -lc "sed -n '1,260p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud_omp.c"
+#include <stdio.h>
+
+#define BS 16
+
+#pragma omp declare target
+static void lud_diagonal_block(float *a, int size, int offset)
+{
+    int i, j, k;
+
+    for (i = 0; i < BS; i++) {
+        for (j = i; j < BS; j++) {
+            float sum = a[(offset + i) * size + offset + j];
+            for (k = 0; k < i; k++) {
+                sum -= a[(offset + i) * size + offset + k] *
+                       a[(offset + k) * size + offset + j];
+            }
+            a[(offset + i) * size + offset + j] = sum;
+        }
+
+        {
+            float inv = 1.f / a[(offset + i) * size + offset + i];
+            for (j = i + 1; j < BS; j++) {
+                float sum = a[(offset + j) * size + offset + i];
+                for (k = 0; k < i; k++) {
+                    sum -= a[(offset + j) * size + offset + k] *
+                           a[(offset + k) * size + offset + i];
+                }
+                a[(offset + j) * size + offset + i] = sum * inv;
+            }
+        }
+    }
+}
+
+static void lud_perimeter_block(float *a, int size, int offset, int chunk_idx)
+{
+    int i, j, k;
+    int i_global = offset;
+    int j_global = offset + BS * (chunk_idx + 1);
+    float temp[BS][BS];
+
+    for (i = 0; i < BS; i++) {
+        for (j = 0; j < BS; j++) {
+            temp[i][j] = a[(offset + i) * size + offset + j];
+        }
+    }
+
+    for (j = 0; j < BS; j++) {
+        for (i = 0; i < BS; i++) {
+            float sum = 0.f;
+            for (k = 0; k < i; k++) {
+                sum += temp[i][k] * a[(offset + k) * size + j_global + j];
+            }
+            a[(i_global + i) * size + j_global + j] -= sum;
+        }
+    }
+
+    j_global = offset;
+    i_global += BS * (chunk_idx + 1);
+    for (i = 0; i < BS; i++) {
+        for (j = 0; j < BS; j++) {
+            float sum = 0.f;
+            for (k = 0; k < j; k++) {
+                sum += a[(i_global + i) * size + offset + k] * temp[k][j];
+            }
+            a[(i_global + i) * size + j_global + j] =
+                (a[(i_global + i) * size + j_global + j] - sum) /
+                a[(offset + j) * size + offset + j];
+        }
+    }
+}
+
+static void lud_interior_block(float *a, int size, int offset, int chunk_idx,
+                               int chunks_in_inter_row)
+{
+    int i, j, k;
+    int i_global = offset + BS * (1 + chunk_idx / chunks_in_inter_row);
+    int j_global = offset + BS * (1 + chunk_idx % chunks_in_inter_row);
+    float temp_top[BS][BS];
+    float temp_left[BS][BS];
+    float sum[BS];
+
+    for (j = 0; j < BS; j++) {
+        sum[j] = 0.f;
+    }
+
+    for (i = 0; i < BS; i++) {
+        for (j = 0; j < BS; j++) {
+            temp_top[i][j] = a[(offset + i) * size + j_global + j];
+            temp_left[i][j] = a[(i_global + i) * size + offset + j];
+        }
+    }
+
+    for (i = 0; i < BS; i++) {
+        for (k = 0; k < BS; k++) {
+            for (j = 0; j < BS; j++) {
+                sum[j] += temp_left[i][k] * temp_top[k][j];
+            }
+        }
+        for (j = 0; j < BS; j++) {
+            a[(i_global + i) * size + j_global + j] -= sum[j];
+            sum[j] = 0.f;
+        }
+    }
+}
+
+#pragma omp end declare target
+
+void lud_omp(float *a, int size)
+{
+    int offset;
+    int total = size * size;
+
+    printf("running omp offload\n");
+
+#pragma omp target data map(tofrom : a[0:total])
+    {
+        for (offset = 0; offset < size - BS; offset += BS) {
+            int size_inter = size - offset - BS;
+            int chunks_in_inter_row = size_inter / BS;
+            int chunks_per_inter = chunks_in_inter_row * chunks_in_inter_row;
+            int chunk_idx;
+
+#pragma omp target map(present, alloc : a[0:total]) firstprivate(size, offset)
+            {
+                lud_diagonal_block(a, size, offset);
+            }
+
+#pragma omp target teams distribute parallel for map(present, alloc : a[0:total]) firstprivate(size, offset, chunks_in_inter_row)
+            for (chunk_idx = 0; chunk_idx < chunks_in_inter_row; chunk_idx++) {
+                lud_perimeter_block(a, size, offset, chunk_idx);
+            }
+
+#pragma omp target teams distribute parallel for map(present, alloc : a[0:total]) firstprivate(size, offset, chunks_in_inter_row, chunks_per_inter)
+            for (chunk_idx = 0; chunk_idx < chunks_per_inter; chunk_idx++) {
+                lud_interior_block(a, size, offset, chunk_idx,
+                                   chunks_in_inter_row);
+            }
+        }
+
+#pragma omp target map(present, alloc : a[0:total]) firstprivate(size, offset)
+        {
+            lud_diagonal_block(a, size, offset);
+        }
+    }
+}
+
+[shell] $ /bin/bash -lc "sed -n '1,180p' /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/Makefile.nvc"
+# Makefile for lud-serial (omp version)
+
+#===============================================================================
+# User Options
+#===============================================================================
+
+# Compiler can be set below, or via environment variable
+CC        = nvc
+OPTIMIZE  = yes
+DEBUG     = no
+DEVICE    = gpu
+SM        = cc89
+LAUNCHER  = env OMP_TARGET_OFFLOAD=MANDATORY
+GATE_ROOT ?= $(abspath ../..)
+REF_DIR   ?= $(GATE_ROOT)/golden_labels/src/lud-serial
+REF_BIN   ?= $(REF_DIR)/main
+REF_MAKE  ?= Makefile.nvc
+VERIFY_CPPFLAGS ?= -DGATE_VERIFY
+
+RUN_ARGS ?= -s 2048
+
+#===============================================================================
+# Program name & source code list
+#===============================================================================
+
+program = lud_omp
+
+source = omp/lud.c omp/lud_omp.c common/common.c
+
+obj = $(source:.c=.o)
+
+#===============================================================================
+# Sets Flags
+#===============================================================================
+
+# Standard Flags
+CFLAGS := $(EXTRA_CFLAGS) -std=c11 -Wall -I$(GATE_ROOT)/golden_labels/src/lud-serial/common
+LDFLAGS = 
+
+# Debug Flags
+ifeq ($(DEBUG),yes)
+  CFLAGS += -g -DDEBUG
+  LDFLAGS  += -g
+endif
+
+
+# Optimization Flags
+ifeq ($(OPTIMIZE),yes)
+  CFLAGS += -O3
+endif
+
+ifeq ($(DEVICE),gpu)
+  CFLAGS += -Minfo=mp -mp=gpu -gpu=$(SM)
+  LDFLAGS += -mp=gpu -gpu=$(SM)
+else
+  CFLAGS +=-qopenmp
+endif
+#===============================================================================
+# Targets to Build
+#===============================================================================
+
+$(program): $(obj)
+	$(CC) $(CFLAGS) $(obj) -o $@ $(LDFLAGS)
+
+%.o: %.cpp
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -rf $(program) $(obj)
+
+run: $(program)
+	$(LAUNCHER) ./$(program) $(RUN_ARGS)
+
+.PHONY: ref_build
+ref_build:
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) clean
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) CC="$(CC)" OPTIMIZE="$(OPTIMIZE)" DEBUG="$(DEBUG)" DEVICE="$(DEVICE)" SM="$(SM)" CFLAGS="$(CFLAGS) -I$(GATE_ROOT)/gate_sdk"
+
+.PHONY: verify_build
+verify_build:
+	$(MAKE) -f Makefile.nvc clean
+	$(MAKE) -f Makefile.nvc EXTRA_CFLAGS="$(VERIFY_CPPFLAGS) $(EXTRA_CFLAGS)"
+
+.PHONY: ref_verify_build
+ref_verify_build:
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) clean
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) CC="$(CC)" OPTIMIZE="$(OPTIMIZE)" DEBUG="$(DEBUG)" DEVICE="$(DEVICE)" SM="$(SM)" CFLAGS="$(VERIFY_CPPFLAGS) $(CFLAGS) -I$(GATE_ROOT)/gate_sdk"
+
+.PHONY: check-correctness
+check-correctness: verify_build ref_verify_build
+	OMP_TARGET_OFFLOAD=MANDATORY python3 $(GATE_ROOT)/gate_sdk/scripts/gate_harness.py $(REF_BIN) ./$(program) $(RUN_ARGS)
+
+The code structure is in place; I’m fixing the remaining build glue now. After that I’ll do a clean rebuild and run the small correctness case before I push to the larger profiling size.
+[file_update] /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/Makefile.nvc
+[shell] $ /bin/bash -lc 'make -f Makefile.nvc clean'
+rm -rf lud_omp omp/lud.o omp/lud_omp.o common/common.o
+
+[shell] $ /bin/bash -lc 'make -f Makefile.nvc'
+"omp/lud.c", line 25: catastrophic error: cannot open source file "common.h"
+  #include "common.h"
+                     ^
+
+1 catastrophic error detected in the compilation of "omp/lud.c".
+Compilation terminated.
+make: *** [Makefile.nvc:66: omp/lud.o] Error 2
+
+The first build flushed out the only path issue so far: `GATE_ROOT` was one directory too shallow for this tree layout. I’m correcting that include root and rebuilding immediately.
+[file_update] /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/Makefile.nvc
+[shell] $ /bin/bash -lc 'make -f Makefile.nvc clean'
+rm -rf lud_omp omp/lud.o omp/lud_omp.o common/common.o
+
+[shell] $ /bin/bash -lc 'make -f Makefile.nvc'
+nvc  -std=c11 -Wall -I/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common -O3 -Minfo=mp -mp=gpu -gpu=cc89 -c omp/lud_omp.c -o omp/lud_omp.o
+lud_omp:
+    124, #omp target
+        124, Generating "nvkernel_lud_omp_F1L124_2" GPU kernel
+    129, #omp target teams distribute parallel for
+        129, Generating "nvkernel_lud_omp_F1L129_4" GPU kernel
+             Loop parallelized across teams and threads(128), schedule(static)
+    134, #omp target teams distribute parallel for
+        134, Generating "nvkernel_lud_omp_F1L134_6" GPU kernel
+             Loop parallelized across teams and threads(128), schedule(static)
+    141, #omp target
+        141, Generating "nvkernel_lud_omp_F1L141_8" GPU kernel
+lud_diagonal_block:
+      7, Generating implicit omp declare target routine
+         Generating NVIDIA GPU code
+lud_perimeter_block:
+     35, Generating implicit omp declare target routine
+         Generating NVIDIA GPU code
+lud_interior_block:
+     74, Generating implicit omp declare target routine
+         Generating NVIDIA GPU code
+nvc  -std=c11 -Wall -I/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common -O3 -Minfo=mp -mp=gpu -gpu=cc89 -c common/common.c -o common/common.o
+"common/common.c", line 187: warning: missing return statement at end of non-void function "lud_verify" [implicit_return_from_non_void_function]
+  }
+  ^
+
+Remark: individual warnings can be suppressed with "--diag_suppress <warning-name>"
+
+nvc  -std=c11 -Wall -I/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common -O3 -Minfo=mp -mp=gpu -gpu=cc89 omp/lud.o omp/lud_omp.o common/common.o -o lud_omp -mp=gpu -gpu=cc89
+
+The GPU build is now compiling and the compiler reports real device kernels for the diagonal and block-update regions, which is the right sign. I’m waiting for the link to finish, then I’ll run the small correctness case and inspect any mismatches before moving to profiling.
+I’m at the validation stage now. First I’ll run the small 32×32 correctness case, then I’ll compare its functional output against the baseline and only move to the larger profiling case if the verification is clean.
+[shell] $ /bin/bash -lc "cd /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp && timeout 300 make -f Makefile.nvc run RUN_ARGS='-s 32 -v' > gpu_output.txt 2>&1 && grep -E \"Verification|SUCCESSFUL|FAILED|>>>Verify<<<<|dismatch|Time consumed\" gpu_output.txt"
+Time consumed(ms): 214.657000
+>>>Verify<<<<
+
+[shell] $ /bin/bash -lc "cd /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp && diff -u <(grep -v '"'^Time consumed'"' baseline_output.txt) <(grep -v '"'^Time consumed'"' gpu_output.txt)"
+--- /dev/fd/63	2026-04-13 12:59:30.439101335 +0300
++++ /dev/fd/62	2026-04-13 12:59:30.439101335 +0300
+@@ -1,6 +1,7 @@
++env OMP_TARGET_OFFLOAD=MANDATORY ./lud_omp -s 32 -v
+ Generate input matrix internally, size =32
+ Creating matrix internally size=32
+ Before LUD
+-running serial
++running omp offload
+ After LUD
+ >>>Verify<<<<
+
+The 32×32 correctness case ran cleanly. I’m doing the required plain build/run check next with the larger default size, then I’ll take a profiling run on that same configuration so the GPU work is large enough to matter.
+[shell] $ /bin/bash -lc 'make -f Makefile.nvc'
+make: 'lud_omp' is up to date.
+
+[shell] $ /bin/bash -lc 'make -f Makefile.nvc clean'
+rm -rf lud_omp omp/lud.o omp/lud_omp.o common/common.o
+
+The last build check raced the clean step because I launched them in parallel. I’m rerunning clean and build sequentially now so the final run check is valid.
+[shell] $ /bin/bash -lc 'make -f Makefile.nvc clean'
+rm -rf lud_omp omp/lud.o omp/lud_omp.o common/common.o
+
+[shell] $ /bin/bash -lc 'make -f Makefile.nvc'
+lud_omp:
+    124, #omp target
+        124, Generating "nvkernel_lud_omp_F1L124_2" GPU kernel
+    129, #omp target teams distribute parallel for
+        129, Generating "nvkernel_lud_omp_F1L129_4" GPU kernel
+             Loop parallelized across teams and threads(128), schedule(static)
+    134, #omp target teams distribute parallel for
+        134, Generating "nvkernel_lud_omp_F1L134_6" GPU kernel
+             Loop parallelized across teams and threads(128), schedule(static)
+    141, #omp target
+        141, Generating "nvkernel_lud_omp_F1L141_8" GPU kernel
+lud_diagonal_block:
+      7, Generating implicit omp declare target routine
+         Generating NVIDIA GPU code
+lud_perimeter_block:
+     35, Generating implicit omp declare target routine
+         Generating NVIDIA GPU code
+lud_interior_block:
+     74, Generating implicit omp declare target routine
+         Generating NVIDIA GPU code
+nvc  -std=c11 -Wall -I/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common -O3 -Minfo=mp -mp=gpu -gpu=cc89 -c common/common.c -o common/common.o
+"common/common.c", line 187: warning: missing return statement at end of non-void function "lud_verify" [implicit_return_from_non_void_function]
+  }
+  ^
+
+Remark: individual warnings can be suppressed with "--diag_suppress <warning-name>"
+
+nvc  -std=c11 -Wall -I/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/golden_labels/src/lud-serial/common -O3 -Minfo=mp -mp=gpu -gpu=cc89 omp/lud.o omp/lud_omp.o common/common.o -o lud_omp -mp=gpu -gpu=cc89
+
+[shell] $ /bin/bash -lc 'cd /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp && timeout 300 make -f Makefile.nvc run > plain_run_output.txt 2>&1 && tail -20 plain_run_output.txt'
+env OMP_TARGET_OFFLOAD=MANDATORY ./lud_omp -s 2048
+Generate input matrix internally, size =2048
+Creating matrix internally size=2048
+running omp offload
+Time consumed(ms): 254.401000
+
+The plain run is good at the larger default size. I’m taking the Nsight profile next with the same 2048 configuration so the log captures actual GPU kernels rather than launch noise.
+[shell] $ /bin/bash -lc 'cd /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp && timeout 300 env FORCE_OMP_GPU=1 OMP_TARGET_OFFLOAD=MANDATORY nsys profile --stats=true --trace=cuda,osrt --force-overwrite=true -o nsys_profile make -f Makefile.nvc run > profile.log 2>&1 && grep -E "cuda_gpu_kern|CUDA GPU Kernel|GPU activities" profile.log | head -10'
+[5/7] Executing 'cuda_gpu_kern_sum' stats report
+
+The implementation and validation are done. I’m updating the plan file so it reflects the real build/run state instead of the initial placeholder assumptions.
+[file_update] /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/data_plan.md
+[shell] $ /bin/bash -lc "cd /root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp && diff -u <(grep -v -E '"'^(Time consumed|env OMP_TARGET_OFFLOAD|running )'"' baseline_output.txt) <(grep -v -E '"'^(Time consumed|env OMP_TARGET_OFFLOAD|running )'"' gpu_output.txt)"
+Implemented the OMP step in [omp/lud_omp.c](/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/omp/lud_omp.c) and fixed [Makefile.nvc](/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/Makefile.nvc). The matrix now stays inside one `target data` region, the diagonal block factorization runs on-device, and the independent perimeter/interior block updates run as GPU kernels. I also added [data_plan.md](/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/data_plan.md).
+
+Verified: `make -f Makefile.nvc clean && make -f Makefile.nvc` succeeded, `make -f Makefile.nvc run` succeeded at the default 2048 size, the 32x32 correctness run matched the baseline on the functional output, and `nsys profile` produced GPU kernel stats in [profile.log](/root/codex_baseline/lud_serial_to_omp_workdir_20260413125118/data/src/lud-omp/profile.log).
+tokens used
+2,332,681

@@ -72,7 +72,7 @@ def run_nsys_in_dir(work_dir: Path) -> Tuple[int, str]:
         return 2, f"Missing {MAKEFILE_NAME} in {work_dir}"
 
     # Clean first
-    clean_cmd = ["make", "-f", MAKEFILE_NAME, "clean"]
+    clean_cmd = ["make", "-f", MAKEFILE_NAME, "clean", "EXTRA_CFLAGS=-gpu=nomanaged"]
     subprocess.run(
         clean_cmd,
         cwd=str(work_dir),
@@ -81,27 +81,38 @@ def run_nsys_in_dir(work_dir: Path) -> Tuple[int, str]:
         text=True,
     )
 
-    # Nsight Systems profile command
-    # We rely on --stats=true to print cuda_gpu_kern_sum to stdout,
-    # and we force-overwrite the report to avoid accumulation between runs.
-    cmd = [
-        "nsys",
-        "profile",
-        "--stats=true",
-        "--trace=cuda,osrt",
-        "--force-overwrite=true",
-        "-o",
-        "nsys_profile",
-        "make",
-        "-f",
-        MAKEFILE_NAME,
-        RUN_TARGET,
-    ]
+    # Build first
+    build_cmd = ["make", "-f", MAKEFILE_NAME, "EXTRA_CFLAGS=-gpu=nomanaged"]
+    build_proc = subprocess.run(
+        build_cmd,
+        cwd=str(work_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if build_proc.returncode != 0:
+        return build_proc.returncode, build_proc.stdout
+
+    # Get execution command via dry run
+    dry_run = subprocess.run(["make", "-n", "-f", MAKEFILE_NAME, RUN_TARGET, "EXTRA_CFLAGS=-gpu=nomanaged"],
+                             cwd=str(work_dir), stdout=subprocess.PIPE, text=True)
+    
+    # Exclude make echo lines
+    run_cmds = [line.strip() for line in dry_run.stdout.splitlines() if line.strip() and not  line.startswith("make")]
+    actual_run_cmd = run_cmds[-1] if run_cmds else "./main"
 
     # Set environment variables for OpenMP GPU offloading
     env = os.environ.copy()
     env["FORCE_OMP_GPU"] = "1"
     env["OMP_TARGET_OFFLOAD"] = "MANDATORY"
+
+    # Nsight Systems profile command
+    cmd = [
+        "sh",
+        "-c",
+        f"nsys profile --stats=true --trace=cuda,osrt "
+        f"--force-overwrite=true -o nsys_profile {actual_run_cmd}",
+    ]
 
     proc = subprocess.run(
         cmd,
@@ -118,16 +129,19 @@ def run_nsys_in_dir(work_dir: Path) -> Tuple[int, str]:
 
 def parse_total_gpu_time_ms(nsys_output: str) -> Optional[float]:
     """
-    Parse Nsight Systems stdout (with cuda_gpu_kern_sum report) and compute
-    the total GPU kernel time by summing 'Total Time (ns)' across all kernels.
-    Returns total time in milliseconds, or None if parsing fails.
+    Parse Nsight Systems stdout and compute GPU time (kernel + memory).
+    Returns time in milliseconds.
     """
-    lines = nsys_output.splitlines()
-    in_kernel_table = False
-    total_ns = 0
+    if not nsys_output:
+        return None
 
-    # We enter the table after seeing the cuda_gpu_kern_sum header
-    # or the "CUDA GPU Kernel Summary" title.
+    lines = nsys_output.splitlines()
+    kernel_ns = 0
+    memory_ns = 0
+
+    # Parse GPU kernel times from cuda_gpu_kern_sum
+    in_kernel_table = False
+    kernel_parsed = False
     for line in lines:
         if "cuda_gpu_kern_sum" in line or "CUDA GPU Kernel Summary" in line:
             in_kernel_table = True
@@ -136,33 +150,64 @@ def parse_total_gpu_time_ms(nsys_output: str) -> Optional[float]:
         if not in_kernel_table:
             continue
 
-        # End of table: blank line or start of another report
         if not line.strip():
-            # allow a blank line to terminate the table
-            if total_ns > 0:
+            if kernel_parsed:
                 break
-            else:
-                continue
+            continue
 
-        # Match data lines: they start with numeric Time (%)
-        # Example:
-        #  94.5       4086451525       1900 ...
         m = re.match(
-            r"^\s*([0-9]+(?:\.[0-9]+)?)\s+([0-9]+)\s+([0-9]+)\s+",
+            r"^\s*([0-9]+(?:\.[0-9]+)?)\s+([0-9,]+)\s+([0-9,]+)\s+",
             line,
         )
         if not m:
-            # If we hit a non-data line after we've already parsed some rows,
-            # assume table ended.
-            if total_ns > 0:
+            if kernel_parsed:
                 break
             continue
 
-        time_percent_str, total_time_ns_str, instances_str = m.groups()
+        _, total_time_ns_str, _ = m.groups()
         try:
-            total_ns += int(total_time_ns_str)
+            kernel_ns += int(total_time_ns_str.replace(",", ""))
+            kernel_parsed = True
         except ValueError:
             continue
+
+    # Parse GPU memory transfer times from cuda_gpu_mem_time_sum
+    in_mem_table = False
+    mem_parsed = False
+    for line in lines:
+        if "cuda_gpu_mem_time_sum" in line or "CUDA GPU Memory Time Summary" in line:
+            in_mem_table = True
+            continue
+
+        if not in_mem_table:
+            continue
+
+        if not line.strip():
+            if mem_parsed:
+                break
+            continue
+
+        m = re.match(
+            r"^\s*([0-9]+(?:\.[0-9]+)?)\s+([0-9,]+)\s+([0-9,]+)\s+",
+            line,
+        )
+        if not m:
+            if "Time (%)" in line or "--------" in line:
+                continue
+            if mem_parsed:
+                break
+            continue
+
+        _, total_time_ns_str, _ = m.groups()
+        try:
+            mem_time = int(total_time_ns_str.replace(",", ""))
+            memory_ns += mem_time
+            mem_parsed = True
+        except ValueError:
+            continue
+
+    # Sum kernel + memory for GPU time
+    total_ns = kernel_ns + memory_ns
 
     if total_ns > 0:
         return total_ns / 1e6  # ns -> ms

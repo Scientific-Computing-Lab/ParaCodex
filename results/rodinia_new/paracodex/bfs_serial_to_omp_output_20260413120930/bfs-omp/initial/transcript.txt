@@ -1,0 +1,953 @@
+I’m checking the kernel-specific analysis workflow and the target hardware summary first, then I’ll inspect the serial BFS source to identify what can be parallelized safely for OpenMP.
+[shell] $ /bin/bash -lc 'cat /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/system_info_summary.txt'
+=== CPU ===
+Architecture:                         x86_64
+CPU(s):                               20
+Model name:                           13th Gen Intel(R) Core(TM) i9-13905H
+Thread(s) per core:                   2
+Core(s) per socket:                   10
+Socket(s):                            1
+NUMA node0 CPU(s):                    0-19
+
+=== MEMORY ===
+Mem:            15Gi       3.1Gi       9.3Gi       4.0Mi       3.1Gi        12Gi
+Swap:          4.0Gi          0B       4.0Gi
+
+=== GPU ===
+| NVIDIA-SMI 580.102.01             Driver Version: 581.57         CUDA Version: 13.0     |
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+|   0  NVIDIA GeForce RTX 4060 ...    On  |   00000000:01:00.0  On |                  N/A |
+Driver Version                            : 581.57
+CUDA Version                              : 13.0
+        GPU Current Temp                  : 48 C
+    FB Memory Usage
+        Total                             : 8188 MiB
+        Reserved                          : 231 MiB
+        Used                              : 1448 MiB
+        Free                              : 6510 MiB
+
+[shell] $ /bin/bash -lc 'cat /root/.codex/skills/paracodex/paracodex-serial-omp-analysis/SKILL.md'
+---
+name: paracodex-serial-omp-analysis
+description: "ParaCodex prompt for serial omp analysis step."
+---
+
+# Loop Classification for GPU Offload - Analysis Phase
+**Directory:** `{kernel_dir}/`  
+**Files:** {file_listing}  
+**Reference:** Check Makefile in `{kernel_dir}/` (do not modify)
+
+## Task
+Analyze loops in `{source_dir}/` and produce `{kernel_dir}/analysis.md`. 
+Copy source files unmodified to `{kernel_dir}/`.
+
+The analysis must identify the natural GPU offload unit, helper-fragmentation risk, and whether the default input is too small to guide optimization reliably.
+
+## Process
+
+### 0. COPY SOURCE FILES
+Copy {file_listing} to {kernel_dir} unmodified.
+
+### 1. Find All Loops
+```bash
+grep -n "for.*iter\|for.*it\|while\|main(" *.c *.cpp 2>/dev/null | head -50
+grep -n "for\s*(" *.c *.cpp 2>/dev/null | head -100
+```
+Prioritize functions called in main compute loop:
+- Every iteration → CRITICAL/IMPORTANT
+- Once at setup → SECONDARY/AVOID
+
+### 2. Classify Priority
+For each loop: `iterations × ops/iter = total work`
+- **CRITICAL:** >50% runtime OR called every iteration with O(N) work
+- **IMPORTANT:** 5-50% runtime OR called every iteration with small work
+- **SECONDARY:** Called once at setup
+- **AVOID:** Setup/IO/RNG OR <10K iterations
+
+### 3. Determine Loop Type & Data Analysis
+**Reference:** `references/examples.md` (See Decision Tree and Type Reference).
+
+**Check for Type H first:** If an outer loop iterates over independent work items and contains an inner loop whose body is guarded by `if (inner_var == 0)`, classify the inner loop as **Type H (CUDA-serial port)** and flag it as **RESTRUCTURE NEEDED** in analysis.md.
+
+Analyze each array:
+- Flat vs pointer-to-pointer?
+- Static vs dynamic?
+- Structs/Globals?
+
+Structural questions to answer during analysis:
+- Is the timed region already a single GPU-shaped loop nest?
+- Is the hot path split across helper functions with tiny outer loops or host-visible stage boundaries?
+- Would preserving the current helper boundaries likely create multiple tiny kernels, extra host/device sync, or poor scaling?
+- If yes, recommend a fused offload unit in `analysis.md` instead of helper-by-helper offload.
+
+Scalability questions to answer during analysis:
+- Is the default input likely too small to expose real kernel, transfer, launch, or host-wait behavior?
+- Is this benchmark likely small-input sensitive, or is the default size already representative?
+- Which quantities should scale with problem size: kernel count, transfer count, transfer volume, host waits, memory footprint?
+- What larger practical profile size should later stages use on the available hardware?
+- Choose a larger profiling size that is large enough to expose sustained GPU behavior on the available device, not just millisecond-scale launch noise; it should materially exercise the GPU while still remaining comfortably within memory and time limits.
+
+### 4. Create Analysis Report
+**Reference:** `references/output.md` (Use this template).
+
+- Fill "Loop Nesting Structure".
+- Fill "Loop Details" for CRITICAL/IMPORTANT/SECONDARY loops.
+- Fill "Summary Table".
+- Fill "Structural Recommendations".
+- Fill "Scalability Check".
+- Fill "Data Details".
+- **Flag Issues:** Variable bounds, reductions, atomics, stage dependency, RNG.
+
+## Constraints
+- Find all loops in functions called from main compute loop.
+- Document only - no pragmas or code modifications.
+- When uncertain between B and C, choose C.
+- Copy all source files unmodified to `{kernel_dir}/`.
+
+I have the hardware summary and analysis instructions. Next I’m reading the BFS source and the local build layout so I can classify the hot loops and decide whether the default input is representative or too small.
+[shell] $ /bin/bash -lc "sed -n '1,260p' /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/bfs.cpp"
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <stdlib.h>
+#include <sys/time.h>
+
+FILE *fp;
+
+//Structure to hold a node information
+struct Node
+{
+	int starting;
+	int no_of_edges;
+};
+
+void BFSGraph(int argc, char** argv);
+
+void Usage(int argc, char**argv){
+
+fprintf(stderr,"Usage: %s <num_threads> <input_file>\n", argv[0]);
+
+}
+////////////////////////////////////////////////////////////////////////////////
+// Main Program
+////////////////////////////////////////////////////////////////////////////////
+int main( int argc, char** argv)
+{
+	BFSGraph( argc, argv);
+}
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+//Apply BFS on a Graph
+////////////////////////////////////////////////////////////////////////////////
+void BFSGraph( int argc, char** argv)
+{
+        int no_of_nodes = 0;
+        int edge_list_size = 0;
+        char *input_f;
+	int	 num_omp_threads;
+
+	if(argc!=3){
+	Usage(argc, argv);
+	exit(0);
+	}
+
+	num_omp_threads = atoi(argv[1]);
+	input_f = argv[2];
+
+	printf("Reading File\n");
+	//Read in Graph from a file
+	fp = fopen(input_f,"r");
+	if(!fp)
+	{
+		printf("Error Reading graph file\n");
+		return;
+	}
+
+	int source = 0;
+
+	fscanf(fp,"%d",&no_of_nodes);
+
+	// allocate host memory
+	Node* h_graph_nodes = (Node*) malloc(sizeof(Node)*no_of_nodes);
+	bool *h_graph_mask = (bool*) malloc(sizeof(bool)*no_of_nodes);
+	bool *h_updating_graph_mask = (bool*) malloc(sizeof(bool)*no_of_nodes);
+	bool *h_graph_visited = (bool*) malloc(sizeof(bool)*no_of_nodes);
+
+	int start, edgeno;
+	// initalize the memory
+	for( unsigned int i = 0; i < no_of_nodes; i++)
+	{
+		fscanf(fp,"%d %d",&start,&edgeno);
+		h_graph_nodes[i].starting = start;
+		h_graph_nodes[i].no_of_edges = edgeno;
+		h_graph_mask[i]=false;
+		h_updating_graph_mask[i]=false;
+		h_graph_visited[i]=false;
+	}
+
+	//read the source node from the file
+	fscanf(fp,"%d",&source);
+
+	//set the source node as true in the mask
+	h_graph_mask[source]=true;
+	h_graph_visited[source]=true;
+
+	fscanf(fp,"%d",&edge_list_size);
+
+	int id,cost;
+	int* h_graph_edges = (int*) malloc(sizeof(int)*edge_list_size);
+	for(int i=0; i < edge_list_size ; i++)
+	{
+		fscanf(fp,"%d",&id);
+		fscanf(fp,"%d",&cost);
+		h_graph_edges[i] = id;
+	}
+
+	if(fp)
+		fclose(fp);
+
+
+	// allocate mem for the result on host side
+	int* h_cost = (int*) malloc( sizeof(int)*no_of_nodes);
+	for(int i=0;i<no_of_nodes;i++)
+		h_cost[i]=-1;
+	h_cost[source]=0;
+
+	printf("Start traversing the tree\n");
+
+	int k=0;
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        double start_time = tv.tv_sec + tv.tv_usec * 1e-6;
+
+	bool stop;
+	do
+        {
+            //if no thread changes this value then the loop stops
+            stop=false;
+
+            for(int tid = 0; tid < no_of_nodes; tid++ )
+            {
+                if (h_graph_mask[tid] == true){
+                    h_graph_mask[tid]=false;
+                    for(int i=h_graph_nodes[tid].starting; i<(h_graph_nodes[tid].no_of_edges + h_graph_nodes[tid].starting); i++)
+                    {
+                        int id = h_graph_edges[i];
+                        if(!h_graph_visited[id])
+                        {
+                            h_cost[id]=h_cost[tid]+1;
+                            h_updating_graph_mask[id]=true;
+                        }
+                    }
+                }
+            }
+
+            for(int tid=0; tid< no_of_nodes ; tid++ )
+            {
+                if (h_updating_graph_mask[tid] == true){
+                    h_graph_mask[tid]=true;
+                    h_graph_visited[tid]=true;
+                    stop=true;
+                    h_updating_graph_mask[tid]=false;
+                }
+            }
+            k++;
+        }
+	while(stop);
+
+        gettimeofday(&tv, NULL);
+        double end_time = tv.tv_sec + tv.tv_usec * 1e-6;
+        printf("Compute time: %lf\n", (end_time - start_time));
+
+	//Store the result into a file
+	FILE *fpo = fopen("result.txt","w");
+	for(int i=0;i<no_of_nodes;i++)
+		fprintf(fpo,"%d) cost:%d\n",i,h_cost[i]);
+	fclose(fpo);
+	printf("Result stored in result.txt\n");
+
+
+	// cleanup memory
+	free( h_graph_nodes);
+	free( h_graph_edges);
+	free( h_graph_mask);
+	free( h_updating_graph_mask);
+	free( h_graph_visited);
+	free( h_cost);
+
+}
+
+[shell] $ /bin/bash -lc "ls -la /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/data/src/bfs-omp && printf '\\n---\\n' && find /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/data/src/bfs-omp -maxdepth 2 -type f | sort"
+total 12
+drwxr-xr-x 2 root root 4096 Apr 13 12:09 .
+drwxr-xr-x 3 root root 4096 Apr 13 12:09 ..
+-rw-r--r-- 1 root root 2566 Apr 13 12:09 Makefile.nvc
+
+---
+/root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/data/src/bfs-omp/Makefile.nvc
+
+[shell] $ /bin/bash -lc "ls -la /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial && printf '\\n---\\n' && find /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial -maxdepth 2 -type f | sort"
+total 14636
+drwxr-xr-x 3 root root     4096 Apr 11 14:25 .
+drwxr-xr-x 3 root root     4096 Apr 13 12:09 ..
+-rwxr-xr-x 1 root root      138 Apr 11 10:24 Makefile
+-rwxr-xr-x 1 root root    42328 Apr 11 10:20 bfs
+-rwxr-xr-x 1 root root     4233 Apr 11 10:21 bfs.cpp
+drwxr-xr-x 2 root root     4096 Apr 11 14:25 common
+-rw-r--r-- 1 root root 14906192 Apr 11 10:20 result.txt
+-rwxr-xr-x 1 root root       38 Apr 11 10:20 run
+-rw-r--r-- 1 root root       46 Apr 11 10:20 run_offload
+
+---
+/root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/Makefile
+/root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/bfs
+/root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/bfs.cpp
+/root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/common/common.mk
+/root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/common/make.config
+/root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/result.txt
+/root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/run
+/root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/run_offload
+
+The source is a single BFS traversal with two frontier-sweeping loops inside the timed region. I’m checking the build/run files now to infer the benchmark input size and whether the default profile is large enough to give meaningful OpenMP scaling guidance.
+[shell] $ /bin/bash -lc "sed -n '1,220p' /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/Makefile"
+# C compiler
+CC = g++
+ICC = icc
+CC_FLAGS = -g -O2
+
+all: bfs
+
+bfs: bfs.cpp
+	$(CC) $(CC_FLAGS) bfs.cpp -o bfs
+
+clean:
+	rm -f bfs result.txt
+
+[shell] $ /bin/bash -lc "sed -n '1,160p' /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/common/common.mk"
+################################################################################
+#
+# Copyright 1993-2006 NVIDIA Corporation.  All rights reserved.
+#
+# NOTICE TO USER:   
+#
+# This source code is subject to NVIDIA ownership rights under U.S. and 
+# international Copyright laws.  
+#
+# NVIDIA MAKES NO REPRESENTATION ABOUT THE SUITABILITY OF THIS SOURCE 
+# CODE FOR ANY PURPOSE.  IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR 
+# IMPLIED WARRANTY OF ANY KIND.  NVIDIA DISCLAIMS ALL WARRANTIES WITH 
+# REGARD TO THIS SOURCE CODE, INCLUDING ALL IMPLIED WARRANTIES OF 
+# MERCHANTABILITY, NONINFRINGEMENT, AND FITNESS FOR A PARTICULAR PURPOSE.   
+# IN NO EVENT SHALL NVIDIA BE LIABLE FOR ANY SPECIAL, INDIRECT, INCIDENTAL, 
+# OR CONSEQUENTIAL DAMAGES, OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS 
+# OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE 
+# OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE 
+# OR PERFORMANCE OF THIS SOURCE CODE.  
+#
+# U.S. Government End Users.  This source code is a "commercial item" as 
+# that term is defined at 48 C.F.R. 2.101 (OCT 1995), consisting  of 
+# "commercial computer software" and "commercial computer software 
+# documentation" as such terms are used in 48 C.F.R. 12.212 (SEPT 1995) 
+# and is provided to the U.S. Government only as a commercial end item.  
+# Consistent with 48 C.F.R.12.212 and 48 C.F.R. 227.7202-1 through 
+# 227.7202-4 (JUNE 1995), all U.S. Government End Users acquire the 
+# source code with only those rights set forth herein.
+#
+################################################################################
+#
+# Common build script
+#
+################################################################################
+
+.SUFFIXES : .cu .cu_dbg_o .c_dbg_o .cpp_dbg_o .cu_rel_o .c_rel_o .cpp_rel_o .cubin
+
+# Add new SM Versions here as devices with new Compute Capability are released
+SM_VERSIONS := sm_10 sm_11 sm_12 sm_13
+
+CUDA_INSTALL_PATH ?= /usr/local/cuda
+
+ifdef cuda-install
+	CUDA_INSTALL_PATH := $(cuda-install)
+endif
+
+# detect OS
+OSUPPER = $(shell uname -s 2>/dev/null | tr [:lower:] [:upper:])
+OSLOWER = $(shell uname -s 2>/dev/null | tr [:upper:] [:lower:])
+# 'linux' is output for Linux system, 'darwin' for OS X
+DARWIN = $(strip $(findstring DARWIN, $(OSUPPER)))
+
+# Basic directory setup for SDK
+# (override directories only if they are not already defined)
+SRCDIR     ?= 
+ROOTDIR    ?= ..
+ROOTBINDIR ?= $(ROOTDIR)/../bin
+BINDIR     ?= $(ROOTBINDIR)/$(OSLOWER)
+ROOTOBJDIR ?= obj
+LIBDIR     := $(ROOTDIR)/../lib
+COMMONDIR  := $(ROOTDIR)/../common
+
+# Compilers
+NVCC       := $(CUDA_INSTALL_PATH)/bin/nvcc 
+CXX        := g++
+CC         := gcc
+LINK       := g++ -fPIC
+
+# Includes
+INCLUDES  += -I. -I$(CUDA_INSTALL_PATH)/include -I$(COMMONDIR)/inc
+
+# architecture flag for cubin build
+CUBIN_ARCH_FLAG := -m32
+
+# Warning flags
+CXXWARN_FLAGS := \
+	-W -Wall \
+	-Wimplicit \
+	-Wswitch \
+	-Wformat \
+	-Wchar-subscripts \
+	-Wparentheses \
+	-Wmultichar \
+	-Wtrigraphs \
+	-Wpointer-arith \
+	-Wcast-align \
+	-Wreturn-type \
+	-Wno-unused-function \
+	$(SPACE)
+
+CWARN_FLAGS := $(CXXWARN_FLAGS) \
+	-Wstrict-prototypes \
+	-Wmissing-prototypes \
+	-Wmissing-declarations \
+	-Wnested-externs \
+	-Wmain \
+
+# Compiler-specific flags
+NVCCFLAGS := 
+CXXFLAGS  := $(CXXWARN_FLAGS)
+CFLAGS    := $(CWARN_FLAGS)
+
+# Common flags
+COMMONFLAGS += $(INCLUDES) -DUNIX
+
+# Debug/release configuration
+ifeq ($(dbg),1)
+	COMMONFLAGS += -g
+	NVCCFLAGS   += -D_DEBUG
+	BINSUBDIR   := debug
+	LIBSUFFIX   := D
+else 
+	COMMONFLAGS += -O3 
+	BINSUBDIR   := release
+	LIBSUFFIX   :=
+	NVCCFLAGS   += --compiler-options -fno-strict-aliasing
+	CXXFLAGS    += -fno-strict-aliasing
+	CFLAGS      += -fno-strict-aliasing
+endif
+
+# append optional arch/SM version flags (such as -arch sm_11)
+#NVCCFLAGS += $(SMVERSIONFLAGS)
+
+# architecture flag for cubin build
+CUBIN_ARCH_FLAG := -m32
+
+# detect if 32 bit or 64 bit system
+HP_64 =	$(shell uname -m | grep 64)
+
+# OpenGL is used or not (if it is used, then it is necessary to include GLEW)
+ifeq ($(USEGLLIB),1)
+
+	ifneq ($(DARWIN),)
+		OPENGLLIB := -L/System/Library/Frameworks/OpenGL.framework/Libraries -lGL -lGLU $(COMMONDIR)/lib/$(OSLOWER)/libGLEW.a
+	else
+		OPENGLLIB := -lGL -lGLU
+
+		ifeq "$(strip $(HP_64))" ""
+			OPENGLLIB += -lGLEW
+		else
+			OPENGLLIB += -lGLEW_x86_64
+		endif
+	endif
+
+	CUBIN_ARCH_FLAG := -m64
+endif
+
+ifeq ($(USEGLUT),1)
+	ifneq ($(DARWIN),)
+		OPENGLLIB += -framework GLUT
+	else
+		OPENGLLIB += -lglut
+	endif
+endif
+
+ifeq ($(USEPARAMGL),1)
+	PARAMGLLIB := -lparamgl$(LIBSUFFIX)
+endif
+
+ifeq ($(USERENDERCHECKGL),1)
+
+[shell] $ /bin/bash -lc "sed -n '1,120p' /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/run"
+./bfs 4 ../../data/bfs/graph1MW_6.txt 
+[shell] $ /bin/bash -lc "sed -n '1,160p' /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/run_offload"
+./bfs_offload 4 ../../data/bfs/graph1MW_6.txt
+
+I’ve confirmed the benchmark runs `graph1MW_6.txt` by default, which already suggests a million-node-scale input. I’m checking the analysis template and any reference rules next so the report matches the expected structure and terminology.
+[shell] $ /bin/bash -lc 'find /root/.codex/skills/paracodex/paracodex-serial-omp-analysis -maxdepth 2 -type f | sort'
+/root/.codex/skills/paracodex/paracodex-serial-omp-analysis/SKILL.md
+/root/.codex/skills/paracodex/paracodex-serial-omp-analysis/references/examples.md
+/root/.codex/skills/paracodex/paracodex-serial-omp-analysis/references/output.md
+
+[shell] $ /bin/bash -lc 'ls -lh /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/data/bfs 2>/dev/null | head -50'
+[shell] $ /bin/bash -lc "find /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930 -name 'graph1MW_6.txt' -o -name 'graph*.txt' | head -20"
+[shell] $ /bin/bash -lc 'cat /root/.codex/skills/paracodex/paracodex-serial-omp-analysis/references/examples.md'
+# Loop Classification Guide
+
+## Decision Tree
+
+```
+Q0: Nested inside another loop? → Note parent
+Q-1 (check FIRST): Outer loop over independent items + inner loop whose body is
+    guarded by `if (inner_var == 0)` to restrict writes to one iteration?
+    → Type H (CUDA-serial port): vestigial intra-block parallelism serialized for CPU.
+      Flag RESTRUCTURE NEEDED.
+Q1: Writes A[idx[i]] with varying idx? → Type D (Histogram)
+Q2: Reads A[i-1] or accumulates across iterations? → Type E (Recurrence - CPU only)
+Q3: Stage loop where L+1 depends on L?
+    - Scratch swap (tmp1↔tmp2)? → C1 (FFT/Butterfly)
+    - Level traversal with stencil calls? → C2 (Multigrid)
+Q4: Inner bound varies with outer index? → Type B (Sparse)
+Q5: Accumulates to scalar? → Type F (Reduction)
+Q6: Accesses neighbors? → Type G (Stencil)
+Default → Type A (Dense)
+```
+
+## Structural Check
+
+Before recommending offload, answer these:
+
+- Is the timed region a single GPU-shaped loop nest already?
+- Is the work split across many helper functions with tiny outer loops?
+- Would preserving the current function boundaries introduce multiple tiny kernels or `target update` traffic?
+- If yes, recommend a fused offload unit in `analysis.md` instead of helper-by-helper offload.
+
+## Special Case - Outer A + Inner E
+When outer loop iterates over INDEPENDENT samples and inner has RNG:
+- Mark outer as Type A (CRITICAL) - parallelizable with per-thread RNG
+- Mark inner RNG as Type E - sequential WITHIN each thread
+- Note: "RNG replicable: YES - each sample can compute its own seed"
+
+## Type Reference
+
+| Type | Pattern | Parallelizable |
+|------|---------|----------------|
+| A | Dense, constant bounds | YES |
+| B | Sparse (CSR), inner bound varies | Outer only |
+| C1 | FFT/Butterfly, scratch swap | Outer only |
+| C2 | Multigrid, hierarchical calls | Outer only |
+| D | Histogram, indirect write | YES + atomic |
+| E | Recurrence, loop-carried dep | NO |
+| F | Reduction to scalar | YES + reduction |
+| G | Stencil, neighbor access | YES |
+| H | CUDA-serial port: outer work-item loop + inner fake-thread loop with `if(var==0)` guard | RESTRUCTURE: eliminate inner loop |
+
+---
+
+## Code Examples
+
+### Finding loops with grep
+```bash
+# Find all for loops
+grep -n "for\s*(" *.c *.cpp 2>/dev/null | head -100
+
+# Find main compute loop (iterations/time-step)
+grep -n "for.*iter\|for.*step\|for.*time\|while\s*(" *.c *.cpp 2>/dev/null | head -30
+
+# Find reductions (loop-carried accumulation)
+grep -n "+=\|sum\|acc\|total" *.c *.cpp 2>/dev/null | head -30
+
+# Find indirect writes (histogram pattern)
+grep -n "\[.*\[" *.c *.cpp 2>/dev/null | head -30
+```
+
+### Timing a region for hotspot identification
+```c
+#include <time.h>
+struct timespec t0, t1;
+clock_gettime(CLOCK_MONOTONIC, &t0);
+// ... region under test ...
+clock_gettime(CLOCK_MONOTONIC, &t1);
+printf("%.4f s\n", (t1.tv_sec-t0.tv_sec) + (t1.tv_nsec-t0.tv_nsec)*1e-9);
+```
+
+### Type A — Dense (parallelizable directly)
+```c
+// Independent iterations: safe to offload
+for (int i = 0; i < N; i++)
+    C[i] = A[i] * B[i];   // No dependency across iterations
+```
+
+### Type B — Sparse/CSR (outer only)
+```c
+for (int row = 0; row < nrows; row++) {
+    double sum = 0.0;
+    for (int k = rowptr[row]; k < rowptr[row+1]; k++)  // Inner bound varies!
+        sum += val[k] * x[col[k]];
+    y[row] = sum;
+}
+```
+
+### Type E — Recurrence (cannot parallelize)
+```c
+for (int i = 1; i < N; i++)
+    A[i] = A[i-1] * alpha + B[i];  // Loop-carried: each iteration needs previous
+```
+
+### Type F — Reduction
+```c
+double sum = 0.0;
+for (int i = 0; i < N; i++)
+    sum += A[i] * B[i];   // Reduction to scalar — parallelizable with reduction clause
+```
+
+### Small staged hot path — fuse rather than preserve helpers
+```c
+// Serial structure
+forward(...);
+backward(...);
+update(...);
+
+// Analysis recommendation:
+// If each stage has low outer parallelism or would become a tiny device region,
+// fuse these stages into one GPU-oriented routine before adding pragmas.
+```
+
+[shell] $ /bin/bash -lc 'cat /root/.codex/skills/paracodex/paracodex-serial-omp-analysis/references/output.md'
+# Analysis Output Template
+
+## Loop Nesting Structure
+```
+- outer_loop (line:X) Type A
+  └── inner_loop_1 (line:Y) Type E
+- standalone_loop (line:Z) Type A
+```
+
+## Loop Details
+For each CRITICAL/IMPORTANT/SECONDARY loop:
+
+### Loop: [function] at [file:line]
+- **Iterations:** [count]
+- **Type:** [A-H] - [reason]
+- **Parent loop:** [none / line:X]
+- **Contains:** [inner loops or none]
+- **Dependencies:** [none / reduction:vars / stage / recurrence]
+- **Nested bounds:** [constant / variable]
+- **Private vars:** [list]
+- **Arrays:** [name(R/W/RW)]
+- **Issues:** [flags]
+
+## Summary Table
+| Function | Type | Priority | Parent | Iterations | Dependencies | Issues |
+|----------|------|----------|--------|------------|--------------|--------|
+
+## Structural Recommendations
+- **Natural offload unit:** [single loop nest / fused routine / helper-by-helper]
+- **Why:** [tie this to workload size, helper count, and synchronization shape]
+- **Fragmentation risk:** [none / low / medium / high]
+- **Would preserving helper boundaries likely create tiny kernels?** [YES/NO]
+
+## Scalability Check
+- **Default input likely too small to guide optimization?** [YES/NO]
+- **Small-input sensitive?** [YES/NO]
+- **Expected scaling risks:** [kernel count / transfer count / transfer volume / host sync / memory footprint / none]
+- **Larger practical profile size recommendation:** [value or rule]
+- **Why this size materially exercises the GPU:** [occupancy / kernel duration / transfer volume / enough parallel work / constrained by memory-time budget]
+
+## Data Details
+- **Dominant compute loop:** [main timed loop]
+- **Arrays swapped between functions?:** YES/NO
+- **Scratch arrays?:** YES/NO
+- **Mid-computation sync?:** YES/NO
+- **RNG in timed loop?:** YES/NO (only if inside timer)
+- **Preferred GPU pragma family:** [`target teams distribute parallel for` / `target teams loop` / other]
+
+I’ve got the analysis template. I’m pulling exact line numbers now so the report can anchor each loop and note the BFS frontier dependencies precisely.
+[shell] $ /bin/bash -lc "nl -ba /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/bfs.cpp | sed -n '1,240p'"
+     1	#include <stdio.h>
+     2	#include <string.h>
+     3	#include <math.h>
+     4	#include <stdlib.h>
+     5	#include <sys/time.h>
+     6	
+     7	FILE *fp;
+     8	
+     9	//Structure to hold a node information
+    10	struct Node
+    11	{
+    12		int starting;
+    13		int no_of_edges;
+    14	};
+    15	
+    16	void BFSGraph(int argc, char** argv);
+    17	
+    18	void Usage(int argc, char**argv){
+    19	
+    20	fprintf(stderr,"Usage: %s <num_threads> <input_file>\n", argv[0]);
+    21	
+    22	}
+    23	////////////////////////////////////////////////////////////////////////////////
+    24	// Main Program
+    25	////////////////////////////////////////////////////////////////////////////////
+    26	int main( int argc, char** argv)
+    27	{
+    28		BFSGraph( argc, argv);
+    29	}
+    30	
+    31	
+    32	
+    33	////////////////////////////////////////////////////////////////////////////////
+    34	//Apply BFS on a Graph
+    35	////////////////////////////////////////////////////////////////////////////////
+    36	void BFSGraph( int argc, char** argv)
+    37	{
+    38	        int no_of_nodes = 0;
+    39	        int edge_list_size = 0;
+    40	        char *input_f;
+    41		int	 num_omp_threads;
+    42	
+    43		if(argc!=3){
+    44		Usage(argc, argv);
+    45		exit(0);
+    46		}
+    47	
+    48		num_omp_threads = atoi(argv[1]);
+    49		input_f = argv[2];
+    50	
+    51		printf("Reading File\n");
+    52		//Read in Graph from a file
+    53		fp = fopen(input_f,"r");
+    54		if(!fp)
+    55		{
+    56			printf("Error Reading graph file\n");
+    57			return;
+    58		}
+    59	
+    60		int source = 0;
+    61	
+    62		fscanf(fp,"%d",&no_of_nodes);
+    63	
+    64		// allocate host memory
+    65		Node* h_graph_nodes = (Node*) malloc(sizeof(Node)*no_of_nodes);
+    66		bool *h_graph_mask = (bool*) malloc(sizeof(bool)*no_of_nodes);
+    67		bool *h_updating_graph_mask = (bool*) malloc(sizeof(bool)*no_of_nodes);
+    68		bool *h_graph_visited = (bool*) malloc(sizeof(bool)*no_of_nodes);
+    69	
+    70		int start, edgeno;
+    71		// initalize the memory
+    72		for( unsigned int i = 0; i < no_of_nodes; i++)
+    73		{
+    74			fscanf(fp,"%d %d",&start,&edgeno);
+    75			h_graph_nodes[i].starting = start;
+    76			h_graph_nodes[i].no_of_edges = edgeno;
+    77			h_graph_mask[i]=false;
+    78			h_updating_graph_mask[i]=false;
+    79			h_graph_visited[i]=false;
+    80		}
+    81	
+    82		//read the source node from the file
+    83		fscanf(fp,"%d",&source);
+    84	
+    85		//set the source node as true in the mask
+    86		h_graph_mask[source]=true;
+    87		h_graph_visited[source]=true;
+    88	
+    89		fscanf(fp,"%d",&edge_list_size);
+    90	
+    91		int id,cost;
+    92		int* h_graph_edges = (int*) malloc(sizeof(int)*edge_list_size);
+    93		for(int i=0; i < edge_list_size ; i++)
+    94		{
+    95			fscanf(fp,"%d",&id);
+    96			fscanf(fp,"%d",&cost);
+    97			h_graph_edges[i] = id;
+    98		}
+    99	
+   100		if(fp)
+   101			fclose(fp);
+   102	
+   103	
+   104		// allocate mem for the result on host side
+   105		int* h_cost = (int*) malloc( sizeof(int)*no_of_nodes);
+   106		for(int i=0;i<no_of_nodes;i++)
+   107			h_cost[i]=-1;
+   108		h_cost[source]=0;
+   109	
+   110		printf("Start traversing the tree\n");
+   111	
+   112		int k=0;
+   113	        struct timeval tv;
+   114	        gettimeofday(&tv, NULL);
+   115	        double start_time = tv.tv_sec + tv.tv_usec * 1e-6;
+   116	
+   117		bool stop;
+   118		do
+   119	        {
+   120	            //if no thread changes this value then the loop stops
+   121	            stop=false;
+   122	
+   123	            for(int tid = 0; tid < no_of_nodes; tid++ )
+   124	            {
+   125	                if (h_graph_mask[tid] == true){
+   126	                    h_graph_mask[tid]=false;
+   127	                    for(int i=h_graph_nodes[tid].starting; i<(h_graph_nodes[tid].no_of_edges + h_graph_nodes[tid].starting); i++)
+   128	                    {
+   129	                        int id = h_graph_edges[i];
+   130	                        if(!h_graph_visited[id])
+   131	                        {
+   132	                            h_cost[id]=h_cost[tid]+1;
+   133	                            h_updating_graph_mask[id]=true;
+   134	                        }
+   135	                    }
+   136	                }
+   137	            }
+   138	
+   139	            for(int tid=0; tid< no_of_nodes ; tid++ )
+   140	            {
+   141	                if (h_updating_graph_mask[tid] == true){
+   142	                    h_graph_mask[tid]=true;
+   143	                    h_graph_visited[tid]=true;
+   144	                    stop=true;
+   145	                    h_updating_graph_mask[tid]=false;
+   146	                }
+   147	            }
+   148	            k++;
+   149	        }
+   150		while(stop);
+   151	
+   152	        gettimeofday(&tv, NULL);
+   153	        double end_time = tv.tv_sec + tv.tv_usec * 1e-6;
+   154	        printf("Compute time: %lf\n", (end_time - start_time));
+   155	
+   156		//Store the result into a file
+   157		FILE *fpo = fopen("result.txt","w");
+   158		for(int i=0;i<no_of_nodes;i++)
+   159			fprintf(fpo,"%d) cost:%d\n",i,h_cost[i]);
+   160		fclose(fpo);
+   161		printf("Result stored in result.txt\n");
+   162	
+   163	
+   164		// cleanup memory
+   165		free( h_graph_nodes);
+   166		free( h_graph_edges);
+   167		free( h_graph_mask);
+   168		free( h_updating_graph_mask);
+   169		free( h_graph_visited);
+   170		free( h_cost);
+   171	
+   172	}
+
+[shell] $ /bin/bash -lc 'cp /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/golden_labels/src/bfs-serial/bfs.cpp /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/data/src/bfs-omp/bfs.cpp'
+I’ve got enough context to write the analysis report. I’m generating `analysis.md` in the target directory now, and I’ll keep the copied `bfs.cpp` untouched.
+[file_add] /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/data/src/bfs-omp/analysis.md
+The report is written. I’m doing a quick pass over the generated analysis to catch any mismatch in the classifications or phrasing before I hand it back.
+[shell] $ /bin/bash -lc "sed -n '1,260p' /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/data/src/bfs-omp/analysis.md"
+# BFS Serial to OpenMP Analysis
+
+## Loop Nesting Structure
+```
+- do/while convergence loop (line:118) Type C2
+  ├── frontier sweep loop (line:123) Type B
+  │   └── neighbor traversal loop (line:127) Type B
+  └── frontier materialization loop (line:139) Type F
+```
+
+## Loop Details
+
+### Loop: `BFSGraph` at `bfs.cpp:118`
+- **Iterations:** BFS levels until frontier exhaustion; data-dependent and unknown a priori.
+- **Type:** C2 - level-by-level traversal with stage dependency across iterations.
+- **Parent loop:** none
+- **Contains:** line 123 frontier sweep, line 139 frontier materialization
+- **Dependencies:** stage dependency via `stop`, frontier-mask state carried between levels
+- **Nested bounds:** variable
+- **Private vars:** `stop`, `k`, loop-local `tid`, `i`, `id` inside children
+- **Arrays:** `h_graph_mask(R/W)`, `h_updating_graph_mask(R/W)`, `h_graph_visited(R/W)`, `h_cost(R/W)`, `h_graph_nodes(R)`, `h_graph_edges(R)`
+- **Issues:** stage dependency; repeated host/device synchronization would be required once per BFS level
+
+### Loop: `BFSGraph` at `bfs.cpp:123`
+- **Iterations:** `no_of_nodes` per BFS level
+- **Type:** B - sparse outer sweep over nodes with variable inner adjacency traversal
+- **Parent loop:** line 118
+- **Contains:** line 127 neighbor traversal loop
+- **Dependencies:** indirect neighbor lookup through `h_graph_nodes[tid]` and `h_graph_edges`
+- **Nested bounds:** variable inner bound from `h_graph_nodes[tid].no_of_edges`
+- **Private vars:** `tid`
+- **Arrays:** `h_graph_mask(R/W)`, `h_graph_nodes(R)`, `h_graph_edges(R)`, `h_graph_visited(R)`, `h_cost(R/W)`, `h_updating_graph_mask(W)`
+- **Issues:** indirect writes to neighbor state; naive parallelization can race when multiple frontier nodes discover the same vertex in the same BFS level
+
+### Loop: `BFSGraph` at `bfs.cpp:127`
+- **Iterations:** sum of degrees for active frontier nodes in the current BFS level
+- **Type:** B - sparse adjacency traversal with variable bound per frontier node
+- **Parent loop:** line 123
+- **Contains:** none
+- **Dependencies:** reads `h_graph_visited[id]` before writing `h_cost[id]` and `h_updating_graph_mask[id]`
+- **Nested bounds:** variable
+- **Private vars:** `i`, `id`
+- **Arrays:** `h_graph_nodes(R)`, `h_graph_edges(R)`, `h_graph_visited(R)`, `h_cost(R/W)`, `h_updating_graph_mask(W)`
+- **Issues:** variable bounds; indirect neighbor access; duplicate-discovery race if parallelized without a frontier ownership rule or atomic test-and-set
+
+### Loop: `BFSGraph` at `bfs.cpp:139`
+- **Iterations:** `no_of_nodes` per BFS level
+- **Type:** F - scalar reduction on `stop` plus independent per-node mask updates
+- **Parent loop:** line 118
+- **Contains:** none
+- **Dependencies:** reduction on `stop`
+- **Nested bounds:** constant
+- **Private vars:** `tid`
+- **Arrays:** `h_graph_mask(R/W)`, `h_updating_graph_mask(R/W)`, `h_graph_visited(R/W)`
+- **Issues:** reduction required for `stop`; array writes are independent by index
+
+## Summary Table
+| Function | Type | Priority | Parent | Iterations | Dependencies | Issues |
+|----------|------|----------|--------|------------|--------------|--------|
+| `BFSGraph` line 118 | C2 | CRITICAL | none | BFS levels | stage dependency | host/device sync per level |
+| `BFSGraph` line 123 | B | CRITICAL | 118 | `no_of_nodes` per level | sparse frontier expansion | indirect writes / duplicate discovery |
+| `BFSGraph` line 127 | B | IMPORTANT | 123 | sum of frontier degrees | neighbor traversal | variable bounds / indirect writes |
+| `BFSGraph` line 139 | F | IMPORTANT | 118 | `no_of_nodes` per level | `stop` reduction | reduction required |
+
+## Structural Recommendations
+- **Natural offload unit:** fuse the per-level BFS body inside the `do/while` convergence loop, not the file I/O or result-writing setup/teardown.
+- **Why:** the timed region is already a single stage-oriented loop nest with a sparse expansion pass and a dense frontier-materialization pass; splitting those passes into separate device regions would increase launch and synchronization overhead on every BFS level.
+- **Fragmentation risk:** medium
+- **Would preserving helper boundaries likely create tiny kernels?** YES, if the two node sweeps are offloaded separately each level; there are no helper functions to split, but the current stage boundaries still encourage extra kernel launches.
+
+## Scalability Check
+- **Default input likely too small to guide optimization?** NO
+- **Small-input sensitive?** NO
+- **Expected scaling risks:** kernel count, host sync, and indirect-memory behavior; transfer volume should be manageable if graph data stays resident
+- **Larger practical profile size recommendation:** keep the `graph1MW_6.txt`-class input as the baseline; if a heavier profile is needed, use a larger graph that still fits comfortably in memory and runs long enough for multi-level BFS to dominate launch overhead
+- **Why this size materially exercises the GPU:** the default benchmark already implies a million-node graph with nontrivial edge volume, so it should sustain enough frontier work to expose level-by-level execution cost instead of millisecond-scale launch noise
+
+## Data Details
+- **Dominant compute loop:** the BFS convergence loop and its two per-level node sweeps
+- **Arrays swapped between functions?:** NO
+- **Scratch arrays?:** YES
+- **Mid-computation sync?:** YES
+- **RNG in timed loop?:** NO
+- **Preferred GPU pragma family:** `target teams distribute parallel for` for the dense node sweeps, with care around the sparse neighbor loop and the `stop` reduction
+
+## Notes
+- Setup loops that read the graph, initialize masks/costs, and write `result.txt` are I/O-bound and should stay on the host.
+- `num_omp_threads` is parsed but unused in the serial source.
+- The frontier discovery step is the main correctness risk for parallelization because multiple parents can touch the same destination vertex in one BFS level.
+
+[shell] $ /bin/bash -lc 'test -f /root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/data/src/bfs-omp/bfs.cpp && echo copied'
+copied
+
+Created the analysis report at [analysis.md](/root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/data/src/bfs-omp/analysis.md) and copied the serial source unchanged to [bfs.cpp](/root/codex_baseline/bfs_serial_to_omp_workdir_20260413120930/data/src/bfs-omp/bfs.cpp).
+
+Key result: the BFS hot path is a level-synchronous stage loop with a sparse neighbor-expansion pass and a dense frontier-materialization pass. The default `graph1MW_6.txt` input looks large enough to be representative, so I marked it as not obviously too small for optimization guidance.
+
+If you want, I can do the next step and turn this into an OpenMP implementation plan for `bfs.cpp`.
+tokens used
+209,393
