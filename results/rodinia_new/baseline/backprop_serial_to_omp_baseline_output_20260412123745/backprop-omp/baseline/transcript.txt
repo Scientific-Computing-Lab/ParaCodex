@@ -1,0 +1,2866 @@
+I’m reading the serial backprop sources and the build file first so I can identify the hot loops, then I’ll port the compute path to OpenMP target offload and validate it with the exact clean/build/run commands you gave.
+[shell] $ /bin/bash -lc "pwd && printf '\\n---\\n' && find golden_labels/src/backprop-serial -maxdepth 1 -type f | sort && printf '\\n---\\n' && find data/src/backprop-omp -maxdepth 1 -type f | sort"
+/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745
+
+---
+golden_labels/src/backprop-serial/Makefile
+golden_labels/src/backprop-serial/README
+golden_labels/src/backprop-serial/backprop.c
+golden_labels/src/backprop-serial/backprop.h
+golden_labels/src/backprop-serial/backprop.o
+golden_labels/src/backprop-serial/backprop_kernel.c
+golden_labels/src/backprop-serial/backprop_kernel.o
+golden_labels/src/backprop-serial/facetrain.c
+golden_labels/src/backprop-serial/facetrain.o
+golden_labels/src/backprop-serial/imagenet.c
+golden_labels/src/backprop-serial/imagenet.o
+golden_labels/src/backprop-serial/run
+
+---
+data/src/backprop-omp/Makefile.nvc
+
+[shell] $ /bin/bash -lc "sed -n '1,240p' golden_labels/src/backprop-serial/backprop.c && printf '\\n---FILE-END---\\n' && sed -n '1,260p' golden_labels/src/backprop-serial/backprop_kernel.c && printf '\\n---FILE-END---\\n' && sed -n '1,260p' golden_labels/src/backprop-serial/facetrain.c && printf '\\n---FILE-END---\\n' && sed -n '1,260p' golden_labels/src/backprop-serial/imagenet.c"
+/*
+ ******************************************************************
+ * HISTORY
+ * 15-Oct-94  Jeff Shufelt (js), Carnegie Mellon University
+ *	Prepared for 15-681, Fall 1994.
+ * Modified by Shuai Che
+ ******************************************************************
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "backprop.h"
+#include <math.h>
+
+#define ABS(x)          (((x) > 0.0) ? (x) : (-(x)))
+
+#define fastcopy(to,from,len)\
+{\
+  register char *_to,*_from;\
+  register int _i,_l;\
+  _to = (char *)(to);\
+  _from = (char *)(from);\
+  _l = (len);\
+  for (_i = 0; _i < _l; _i++) *_to++ = *_from++;\
+}
+
+/*** Return random number between 0.0 and 1.0 ***/
+float drnd()
+{
+  return ((float) rand() / (float) BIGRND);
+}
+
+/*** Return random number between -1.0 and 1.0 ***/
+float dpn1()
+{
+  return ((drnd() * 2.0) - 1.0);
+}
+
+/*** The squashing function.  Currently, it's a sigmoid. ***/
+
+float squash(x)
+float x;
+{
+  float m;
+  //x = -x;
+  //m = 1 + x + x*x/2 + x*x*x/6 + x*x*x*x/24 + x*x*x*x*x/120;
+  //return(1.0 / (1.0 + m));
+  return (1.0 / (1.0 + exp(-x)));
+}
+
+
+/*** Allocate 1d array of floats ***/
+
+float *alloc_1d_dbl(n)
+int n;
+{
+  float *new;
+
+  new = (float *) malloc ((unsigned) (n * sizeof (float)));
+  if (new == NULL) {
+    printf("ALLOC_1D_DBL: Couldn't allocate array of floats\n");
+    return (NULL);
+  }
+  return (new);
+}
+
+
+/*** Allocate 2d array of floats ***/
+
+float **alloc_2d_dbl(m, n)
+int m, n;
+{
+  int i;
+  float **new;
+
+  new = (float **) malloc ((unsigned) (m * sizeof (float *)));
+  if (new == NULL) {
+    printf("ALLOC_2D_DBL: Couldn't allocate array of dbl ptrs\n");
+    return (NULL);
+  }
+
+  for (i = 0; i < m; i++) {
+    new[i] = alloc_1d_dbl(n);
+  }
+
+  return (new);
+}
+
+
+bpnn_randomize_weights(w, m, n)
+float **w;
+int m, n;
+{
+  int i, j;
+
+  for (i = 0; i <= m; i++) {
+    for (j = 0; j <= n; j++) {
+     w[i][j] = (float) rand()/RAND_MAX;
+    //  w[i][j] = dpn1();
+    }
+  }
+}
+
+bpnn_randomize_row(w, m)
+float *w;
+int m;
+{
+	int i;
+	for (i = 0; i <= m; i++) {
+     //w[i] = (float) rand()/RAND_MAX;
+	 w[i] = 0.1;
+    }
+}
+
+
+bpnn_zero_weights(w, m, n)
+float **w;
+int m, n;
+{
+  int i, j;
+
+  for (i = 0; i <= m; i++) {
+    for (j = 0; j <= n; j++) {
+      w[i][j] = 0.0;
+    }
+  }
+}
+
+
+void bpnn_initialize(seed)
+{
+  printf("Random number generator seed: %d\n", seed);
+  srand(seed);
+}
+
+
+BPNN *bpnn_internal_create(n_in, n_hidden, n_out)
+int n_in, n_hidden, n_out;
+{
+  BPNN *newnet;
+
+  newnet = (BPNN *) malloc (sizeof (BPNN));
+  if (newnet == NULL) {
+    printf("BPNN_CREATE: Couldn't allocate neural network\n");
+    return (NULL);
+  }
+
+  newnet->input_n = n_in;
+  newnet->hidden_n = n_hidden;
+  newnet->output_n = n_out;
+  newnet->input_units = alloc_1d_dbl(n_in + 1);
+  newnet->hidden_units = alloc_1d_dbl(n_hidden + 1);
+  newnet->output_units = alloc_1d_dbl(n_out + 1);
+
+  newnet->hidden_delta = alloc_1d_dbl(n_hidden + 1);
+  newnet->output_delta = alloc_1d_dbl(n_out + 1);
+  newnet->target = alloc_1d_dbl(n_out + 1);
+
+  newnet->input_weights = alloc_2d_dbl(n_in + 1, n_hidden + 1);
+  newnet->hidden_weights = alloc_2d_dbl(n_hidden + 1, n_out + 1);
+
+  newnet->input_prev_weights = alloc_2d_dbl(n_in + 1, n_hidden + 1);
+  newnet->hidden_prev_weights = alloc_2d_dbl(n_hidden + 1, n_out + 1);
+
+  return (newnet);
+}
+
+
+void bpnn_free(net)
+BPNN *net;
+{
+  int n1, n2, i;
+
+  n1 = net->input_n;
+  n2 = net->hidden_n;
+
+  free((char *) net->input_units);
+  free((char *) net->hidden_units);
+  free((char *) net->output_units);
+
+  free((char *) net->hidden_delta);
+  free((char *) net->output_delta);
+  free((char *) net->target);
+
+  for (i = 0; i <= n1; i++) {
+    free((char *) net->input_weights[i]);
+    free((char *) net->input_prev_weights[i]);
+  }
+  free((char *) net->input_weights);
+  free((char *) net->input_prev_weights);
+
+  for (i = 0; i <= n2; i++) {
+    free((char *) net->hidden_weights[i]);
+    free((char *) net->hidden_prev_weights[i]);
+  }
+  free((char *) net->hidden_weights);
+  free((char *) net->hidden_prev_weights);
+
+  free((char *) net);
+}
+
+
+/*** Creates a new fully-connected network from scratch,
+     with the given numbers of input, hidden, and output units.
+     Threshold units are automatically included.  All weights are
+     randomly initialized.
+
+     Space is also allocated for temporary storage (momentum weights,
+     error computations, etc).
+***/
+
+BPNN *bpnn_create(n_in, n_hidden, n_out)
+int n_in, n_hidden, n_out;
+{
+
+  BPNN *newnet;
+
+  newnet = bpnn_internal_create(n_in, n_hidden, n_out);
+
+#ifdef INITZERO
+  bpnn_zero_weights(newnet->input_weights, n_in, n_hidden);
+#else
+  bpnn_randomize_weights(newnet->input_weights, n_in, n_hidden);
+#endif
+  bpnn_randomize_weights(newnet->hidden_weights, n_hidden, n_out);
+  bpnn_zero_weights(newnet->input_prev_weights, n_in, n_hidden);
+  bpnn_zero_weights(newnet->hidden_prev_weights, n_hidden, n_out);
+  bpnn_randomize_row(newnet->target, n_out);
+  return (newnet);
+}
+
+
+void bpnn_layerforward(l1, l2, conn, n1, n2)
+float *l1, *l2, **conn;
+int n1, n2;
+{
+  float sum;
+  int j, k;
+
+  /*** Set up thresholding unit ***/
+
+---FILE-END---
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <sys/time.h>
+
+#include "backprop.h"
+
+////////////////////////////////////////////////////////////////////////////////
+
+extern void bpnn_layerforward(float *l1, float *l2, float **conn, int n1, int n2);
+
+extern void bpnn_output_error(float *delta, float *target, float *output, int nj, float *err);
+
+extern void bpnn_hidden_error(float *delta_h, int nh, float *delta_o, int no, float **who, float *hidden, float *err);
+
+extern void bpnn_adjust_weights(float *delta, int ndelta, float *ly, int nly, float **w, float **oldw);
+
+
+extern int setup(int argc, char** argv);
+
+extern float **alloc_2d_dbl(int m, int n);
+
+extern float squash(float x);
+
+double gettime() {
+  struct timeval t;
+  gettimeofday(&t,NULL);
+  return t.tv_sec+t.tv_usec*1e-6;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Program main
+////////////////////////////////////////////////////////////////////////////////
+int
+main( int argc, char** argv) 
+{
+	setup(argc, argv);
+}
+
+
+void bpnn_train_kernel(BPNN *net, float *eo, float *eh)
+{
+  int in, hid, out;
+  float out_err, hid_err;
+  
+  in = net->input_n;
+  hid = net->hidden_n;
+  out = net->output_n;   
+   
+  printf("Performing CPU computation\n");
+  bpnn_layerforward(net->input_units, net->hidden_units,net->input_weights, in, hid);
+  bpnn_layerforward(net->hidden_units, net->output_units, net->hidden_weights, hid, out);
+  bpnn_output_error(net->output_delta, net->target, net->output_units, out, &out_err);
+  bpnn_hidden_error(net->hidden_delta, hid, net->output_delta, out, net->hidden_weights, net->hidden_units, &hid_err);  
+  bpnn_adjust_weights(net->output_delta, out, net->hidden_units, hid, net->hidden_weights, net->hidden_prev_weights);
+  bpnn_adjust_weights(net->hidden_delta, hid, net->input_units, in, net->input_weights, net->input_prev_weights);
+
+}
+
+---FILE-END---
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include "backprop.h"
+#include "omp.h"
+
+extern char *strcpy();
+extern void exit();
+
+int layer_size = 0;
+
+backprop_face()
+{
+  BPNN *net;
+  int i;
+  float out_err, hid_err;
+  net = bpnn_create(layer_size, 16, 1); // (16, 1 can not be changed)
+  printf("Input layer size : %d\n", layer_size);
+  load(net);
+  //entering the training kernel, only one iteration
+  printf("Starting training kernel\n");
+  bpnn_train_kernel(net, &out_err, &hid_err);
+  bpnn_free(net);
+  printf("Training done\n");
+}
+
+int setup(argc, argv)
+int argc;
+char *argv[];
+{
+  if(argc!=2){
+  fprintf(stderr, "usage: backprop <num of input elements>\n");
+  exit(0);
+  }
+
+  layer_size = atoi(argv[1]);
+  
+  int seed;
+
+  seed = 7;   
+  bpnn_initialize(seed);
+  backprop_face();
+
+  exit(0);
+}
+
+---FILE-END---
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "backprop.h"
+
+extern layer_size;
+
+load(net)
+BPNN *net;
+{
+  float *units;
+  int nr, nc, imgsize, i, j, k;
+
+  nr = layer_size;
+  
+  imgsize = nr * nc;
+  units = net->input_units;
+
+  k = 1;
+  for (i = 0; i < nr; i++) {
+	  units[k] = (float) rand()/RAND_MAX ;
+	  k++;
+    }
+}
+
+I’ve identified the entry points: `facetrain.c` drives a single training iteration, `backprop.c` holds the math kernels, and `backprop_kernel.c` currently has a likely placeholder loader. Next I’m checking the remaining kernel code and the target Makefile so I can offload the right loops without breaking the build.
+[shell] $ /bin/bash -lc "sed -n '261,520p' golden_labels/src/backprop-serial/backprop_kernel.c && printf '\\n---FILE-END---\\n' && sed -n '1,260p' golden_labels/src/backprop-serial/backprop.h"
+
+---FILE-END---
+#ifndef _BACKPROP_H_
+#define _BACKPROP_H_
+
+#define BIGRND 0x7fffffff
+
+
+#define ETA 0.3       //eta value
+#define MOMENTUM 0.3  //momentum value
+#define NUM_THREAD 8 //OpenMP threads
+
+
+typedef struct {
+  int input_n;                  /* number of input units */
+  int hidden_n;                 /* number of hidden units */
+  int output_n;                 /* number of output units */
+
+  float *input_units;          /* the input units */
+  float *hidden_units;         /* the hidden units */
+  float *output_units;         /* the output units */
+
+  float *hidden_delta;         /* storage for hidden unit error */
+  float *output_delta;         /* storage for output unit error */
+
+  float *target;               /* storage for target vector */
+
+  float **input_weights;       /* weights from input to hidden layer */
+  float **hidden_weights;      /* weights from hidden to output layer */
+
+                                /*** The next two are for momentum ***/
+  float **input_prev_weights;  /* previous change on input to hidden wgt */
+  float **hidden_prev_weights; /* previous change on hidden to output wgt */
+} BPNN;
+
+
+/*** User-level functions ***/
+
+void bpnn_initialize();
+
+BPNN *bpnn_create();
+void bpnn_free();
+
+void bpnn_train();
+void bpnn_feedforward();
+
+void bpnn_save();
+BPNN *bpnn_read();
+
+
+#endif
+
+[shell] $ /bin/bash -lc "sed -n '1,240p' data/src/backprop-omp/Makefile.nvc"
+# Makefile for backprop-serial (omp version)
+
+#===============================================================================
+# User Options
+#===============================================================================
+
+# Compiler can be set below, or via environment variable
+CC        = nvc++
+OPTIMIZE  = yes
+DEBUG     = no
+DEVICE    = gpu
+SM        = cc89
+LAUNCHER  =
+GATE_ROOT ?= $(abspath ../..)
+REF_DIR   ?= $(GATE_ROOT)/golden_labels/src/backprop-serial
+REF_BIN   ?= $(REF_DIR)/main
+REF_MAKE  ?= Makefile.nvc
+
+RUN_ARGS ?= <RUN_ARGS>
+
+#===============================================================================
+# Program name & source code list
+#===============================================================================
+
+program = <PROGRAM_NAME>
+
+source = <SOURCE_FILES>
+
+obj = $(source:.cpp=.o)
+
+#===============================================================================
+# Sets Flags
+#===============================================================================
+
+# Standard Flags
+CFLAGS := $(EXTRA_CFLAGS) -std=c++14 -Wall -I$(GATE_ROOT)/gate_sdk
+LDFLAGS = 
+
+# Debug Flags
+ifeq ($(DEBUG),yes)
+  CFLAGS += -g -DDEBUG
+  LDFLAGS  += -g
+endif
+
+
+# Optimization Flags
+ifeq ($(OPTIMIZE),yes)
+  CFLAGS += -O3
+endif
+
+ifeq ($(DEVICE),gpu)
+  CFLAGS +=-Minfo -mp=gpu -gpu=$(SM)
+else
+  CFLAGS +=-qopenmp
+endif
+#===============================================================================
+# Targets to Build
+#===============================================================================
+
+$(program): $(obj)
+	$(CC) $(CFLAGS) $(obj) -o $@ $(LDFLAGS)
+
+%.o: %.cpp
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -rf $(program) $(obj)
+
+run: $(program)
+	$(LAUNCHER) ./$(program) $(RUN_ARGS)
+
+.PHONY: ref_build
+ref_build:
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) clean
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) CC="$(CC)" OPTIMIZE="$(OPTIMIZE)" DEBUG="$(DEBUG)" DEVICE="$(DEVICE)" SM="$(SM)" CFLAGS="$(CFLAGS) -I$(GATE_ROOT)/gate_sdk"
+
+.PHONY: check-correctness
+check-correctness: $(program) ref_build
+	OMP_TARGET_OFFLOAD=MANDATORY python3 $(GATE_ROOT)/gate_sdk/scripts/gate_harness.py $(REF_BIN) ./$(program) $(RUN_ARGS)
+
+[shell] $ /bin/bash -lc 'grep -n "''^void bpnn_layerforward'"\\|"'^void bpnn_output_error'"\\|"'^void bpnn_hidden_error'"\\|"'^void bpnn_adjust_weights" -n golden_labels/src/backprop-serial/backprop.c && sed -n '"'240,520p' golden_labels/src/backprop-serial/backprop.c"
+233:void bpnn_layerforward(l1, l2, conn, n1, n2)
+255:void bpnn_output_error(delta, target, output, nj, err)  
+272:void bpnn_hidden_error(delta_h,   
+299:void bpnn_adjust_weights(delta, ndelta, ly, nly, w, oldw)
+  /*** Set up thresholding unit ***/
+  l1[0] = 1.0;
+  /*** For each unit in second layer ***/
+  for (j = 1; j <= n2; j++) {
+
+    /*** Compute weighted sum of its inputs ***/
+    sum = 0.0;
+    for (k = 0; k <= n1; k++) {	
+      sum += conn[k][j] * l1[k]; 
+    }
+    l2[j] = squash(sum);
+  }
+}
+
+//extern "C"
+void bpnn_output_error(delta, target, output, nj, err)  
+float *delta, *target, *output, *err;
+int nj;
+{
+  int j;
+  float o, t, errsum;
+  errsum = 0.0;
+  for (j = 1; j <= nj; j++) {
+    o = output[j];
+    t = target[j];
+    delta[j] = o * (1.0 - o) * (t - o);
+    errsum += ABS(delta[j]);
+  }
+  *err = errsum;
+}
+
+
+void bpnn_hidden_error(delta_h,   
+					   nh, 
+					   delta_o, 
+					   no, 
+					   who, 
+					   hidden, 
+					   err)
+float *delta_h, *delta_o, *hidden, **who, *err;
+int nh, no;
+{
+  int j, k;
+  float h, sum, errsum;
+
+  errsum = 0.0;
+  for (j = 1; j <= nh; j++) {
+    h = hidden[j];
+    sum = 0.0;
+    for (k = 1; k <= no; k++) {
+      sum += delta_o[k] * who[j][k];
+    }
+    delta_h[j] = h * (1.0 - h) * sum;
+    errsum += ABS(delta_h[j]);
+  }
+  *err = errsum;
+}
+
+
+void bpnn_adjust_weights(delta, ndelta, ly, nly, w, oldw)
+float *delta, *ly, **w, **oldw;
+{
+  float new_dw;
+  int k, j;
+  ly[0] = 1.0;
+  //eta = 0.3;
+  //momentum = 0.3;
+
+  for (j = 1; j <= ndelta; j++) {
+    for (k = 0; k <= nly; k++) {
+      new_dw = ((ETA * delta[j] * ly[k]) + (MOMENTUM * oldw[k][j]));
+	  w[k][j] += new_dw;
+	  oldw[k][j] = new_dw;
+    }
+  }
+}
+
+
+void bpnn_feedforward(net)
+BPNN *net;
+{
+  int in, hid, out;
+
+  in = net->input_n;
+  hid = net->hidden_n;
+  out = net->output_n;
+
+  /*** Feed forward input activations. ***/
+  bpnn_layerforward(net->input_units, net->hidden_units,
+      net->input_weights, in, hid);
+  bpnn_layerforward(net->hidden_units, net->output_units,
+      net->hidden_weights, hid, out);
+
+}
+
+
+void bpnn_train(net, eo, eh)
+BPNN *net;
+float *eo, *eh;
+{
+  int in, hid, out;
+  float out_err, hid_err;
+
+  in = net->input_n;
+  hid = net->hidden_n;
+  out = net->output_n;
+
+  /*** Feed forward input activations. ***/
+  bpnn_layerforward(net->input_units, net->hidden_units,
+      net->input_weights, in, hid);
+  bpnn_layerforward(net->hidden_units, net->output_units,
+      net->hidden_weights, hid, out);
+
+  /*** Compute error on output and hidden units. ***/
+  bpnn_output_error(net->output_delta, net->target, net->output_units,
+      out, &out_err);
+  bpnn_hidden_error(net->hidden_delta, hid, net->output_delta, out,
+      net->hidden_weights, net->hidden_units, &hid_err);
+  *eo = out_err;
+  *eh = hid_err;
+
+  /*** Adjust input and hidden weights. ***/
+  bpnn_adjust_weights(net->output_delta, out, net->hidden_units, hid,
+      net->hidden_weights, net->hidden_prev_weights);
+  bpnn_adjust_weights(net->hidden_delta, hid, net->input_units, in,
+      net->input_weights, net->input_prev_weights);
+
+}
+
+
+
+
+void bpnn_save(net, filename)
+BPNN *net;
+char *filename;
+{
+  int n1, n2, n3, i, j, memcnt;
+  float dvalue, **w;
+  char *mem;
+  ///add//
+  FILE *pFile;
+  pFile = fopen( filename, "w+" );
+  ///////
+  /*
+  if ((fd = creat(filename, 0644)) == -1) {
+    printf("BPNN_SAVE: Cannot create '%s'\n", filename);
+    return;
+  }
+  */
+
+  n1 = net->input_n;  n2 = net->hidden_n;  n3 = net->output_n;
+  printf("Saving %dx%dx%d network to '%s'\n", n1, n2, n3, filename);
+  //fflush(stdout);
+
+  //write(fd, (char *) &n1, sizeof(int));
+  //write(fd, (char *) &n2, sizeof(int));
+  //write(fd, (char *) &n3, sizeof(int));
+
+  fwrite( (char *) &n1 , sizeof(char), sizeof(char), pFile);
+  fwrite( (char *) &n2 , sizeof(char), sizeof(char), pFile);
+  fwrite( (char *) &n3 , sizeof(char), sizeof(char), pFile);
+
+  
+
+  memcnt = 0;
+  w = net->input_weights;
+  mem = (char *) malloc ((unsigned) ((n1+1) * (n2+1) * sizeof(float)));
+  for (i = 0; i <= n1; i++) {
+    for (j = 0; j <= n2; j++) {
+      dvalue = w[i][j];
+      fastcopy(&mem[memcnt], &dvalue, sizeof(float));
+      memcnt += sizeof(float);
+    }
+  }
+  //write(fd, mem, (n1+1) * (n2+1) * sizeof(float));
+  fwrite( mem , (unsigned)(sizeof(float)), (unsigned) ((n1+1) * (n2+1) * sizeof(float)) , pFile);
+  free(mem);
+
+  memcnt = 0;
+  w = net->hidden_weights;
+  mem = (char *) malloc ((unsigned) ((n2+1) * (n3+1) * sizeof(float)));
+  for (i = 0; i <= n2; i++) {
+    for (j = 0; j <= n3; j++) {
+      dvalue = w[i][j];
+      fastcopy(&mem[memcnt], &dvalue, sizeof(float));
+      memcnt += sizeof(float);
+    }
+  }
+  //write(fd, mem, (n2+1) * (n3+1) * sizeof(float));
+  fwrite( mem , sizeof(float), (unsigned) ((n2+1) * (n3+1) * sizeof(float)) , pFile);
+  free(mem);
+
+  fclose(pFile);
+  return;
+}
+
+
+BPNN *bpnn_read(filename)
+char *filename;
+{
+  char *mem;
+  BPNN *new;
+  int fd, n1, n2, n3, i, j, memcnt;
+
+  if ((fd = open(filename, 0, 0644)) == -1) {
+    return (NULL);
+  }
+
+  printf("Reading '%s'\n", filename);  //fflush(stdout);
+
+  read(fd, (char *) &n1, sizeof(int));
+  read(fd, (char *) &n2, sizeof(int));
+  read(fd, (char *) &n3, sizeof(int));
+  new = bpnn_internal_create(n1, n2, n3);
+
+  printf("'%s' contains a %dx%dx%d network\n", filename, n1, n2, n3);
+  printf("Reading input weights...");  //fflush(stdout);
+
+  memcnt = 0;
+  mem = (char *) malloc ((unsigned) ((n1+1) * (n2+1) * sizeof(float)));
+  read(fd, mem, (n1+1) * (n2+1) * sizeof(float));
+  for (i = 0; i <= n1; i++) {
+    for (j = 0; j <= n2; j++) {
+      fastcopy(&(new->input_weights[i][j]), &mem[memcnt], sizeof(float));
+      memcnt += sizeof(float);
+    }
+  }
+  free(mem);
+
+  printf("Done\nReading hidden weights...");  //fflush(stdout);
+
+  memcnt = 0;
+  mem = (char *) malloc ((unsigned) ((n2+1) * (n3+1) * sizeof(float)));
+  read(fd, mem, (n2+1) * (n3+1) * sizeof(float));
+  for (i = 0; i <= n2; i++) {
+    for (j = 0; j <= n3; j++) {
+      fastcopy(&(new->hidden_weights[i][j]), &mem[memcnt], sizeof(float));
+      memcnt += sizeof(float);
+    }
+  }
+  free(mem);
+  close(fd);
+
+  printf("Done\n");  //fflush(stdout);
+
+  bpnn_zero_weights(new->input_prev_weights, n1, n2);
+  bpnn_zero_weights(new->hidden_prev_weights, n2, n3);
+
+  return (new);
+}
+
+[shell] $ /bin/bash -lc "find data/src/backprop-omp -maxdepth 1 -type f -printf '%f\\n' | sort && printf '\\n---\\n' && ls -la data/src/backprop-omp"
+Makefile.nvc
+
+---
+total 12
+drwxr-xr-x 2 root root 4096 Apr 12 12:37 .
+drwxr-xr-x 3 root root 4096 Apr 12 12:37 ..
+-rw-r--r-- 1 root root 2123 Apr 12 12:37 Makefile.nvc
+
+The target Makefile is still a placeholder and currently only knows how to build `.cpp` files, so I’m checking the serial build metadata before I rewrite it. After that I’ll port the math kernels, keep allocation/IO on the host, and wire the GPU data regions around the core training step.
+[shell] $ /bin/bash -lc "sed -n '1,220p' golden_labels/src/backprop-serial/Makefile && printf '\\n---FILE-END---\\n' && sed -n '1,220p' golden_labels/src/backprop-serial/README"
+# C compiler
+CC = gcc
+CC_FLAGS = -g -O2
+
+
+backprop: backprop.o facetrain.o imagenet.o backprop_kernel.o 
+	$(CC) $(CC_FLAGS) backprop.o facetrain.o imagenet.o backprop_kernel.o -o backprop -lm
+
+%.o: %.[ch]
+	$(CC) $(CC_FLAGS) $< -c
+
+facetrain.o: facetrain.c backprop.h
+	$(CC) $(CC_FLAGS) facetrain.c -c
+	
+backprop.o: backprop.c backprop.h
+	$(CC) $(CC_FLAGS) backprop.c -c
+
+backprop_kernel.o: backprop_kernel.c backprop.h
+	$(CC) $(CC_FLAGS) backprop_kernel.c -c
+
+imagenet.o: imagenet.c backprop.h
+	$(CC) $(CC_FLAGS) imagenet.c -c
+
+
+clean:
+	rm -f *.o *~ backprop backprop_cuda.linkinfo
+
+---FILE-END---
+To change the number of OMP threads,
+please modify NUM_THREAD in backprop.h
+[shell] $ /bin/bash -lc "sed -n '1,240p' golden_labels/src/backprop-serial/run"
+./backprop 65536
+
+[shell] $ /bin/bash -lc 'command -v nvc || true; command -v nvc++ || true; command -v gcc || true; command -v clang || true'
+/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/bin/nvc
+/opt/nvidia/hpc_sdk/Linux_x86_64/25.7/compilers/bin/nvc++
+/usr/bin/gcc
+/opt/sycl/bin/clang
+
+[shell] $ /bin/bash -lc 'rg -n "#pragma omp target|omp target|target teams|declare target|omp_get" -S data/src golden_labels/src | head -n 200'
+I’ve got enough context to implement this without touching the program flow: the run path is a single training pass, so I can keep the host setup intact, make the 2D weights contiguous for device mapping, and move the forward/error/update loops into OpenMP target regions. I’m editing the target sources and the NVC Makefile now.
+I’m seeding the target directory with the serial sources first so I can patch them surgically instead of rewriting everything from scratch. After that I’ll apply the GPU-specific changes and makefile fixes in place.
+[shell] $ /bin/bash -lc 'cp golden_labels/src/backprop-serial/backprop.c data/src/backprop-omp/backprop.c && cp golden_labels/src/backprop-serial/backprop_kernel.c data/src/backprop-omp/backprop_kernel.c && cp golden_labels/src/backprop-serial/facetrain.c data/src/backprop-omp/facetrain.c && cp golden_labels/src/backprop-serial/imagenet.c data/src/backprop-omp/imagenet.c && cp golden_labels/src/backprop-serial/backprop.h data/src/backprop-omp/backprop.h'
+The first patch missed the exact file context because I copied the serial sources into the target tree before editing. I’m re-reading the target files and then I’ll apply smaller patches against the actual text so I don’t disturb unrelated code.
+[shell] $ /bin/bash -lc "sed -n '1,220p' data/src/backprop-omp/backprop.c && printf '\\n---FILE-END---\\n' && sed -n '220,420p' data/src/backprop-omp/backprop.c"
+/*
+ ******************************************************************
+ * HISTORY
+ * 15-Oct-94  Jeff Shufelt (js), Carnegie Mellon University
+ *	Prepared for 15-681, Fall 1994.
+ * Modified by Shuai Che
+ ******************************************************************
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "backprop.h"
+#include <math.h>
+
+#define ABS(x)          (((x) > 0.0) ? (x) : (-(x)))
+
+#define fastcopy(to,from,len)\
+{\
+  register char *_to,*_from;\
+  register int _i,_l;\
+  _to = (char *)(to);\
+  _from = (char *)(from);\
+  _l = (len);\
+  for (_i = 0; _i < _l; _i++) *_to++ = *_from++;\
+}
+
+/*** Return random number between 0.0 and 1.0 ***/
+float drnd()
+{
+  return ((float) rand() / (float) BIGRND);
+}
+
+/*** Return random number between -1.0 and 1.0 ***/
+float dpn1()
+{
+  return ((drnd() * 2.0) - 1.0);
+}
+
+/*** The squashing function.  Currently, it's a sigmoid. ***/
+
+float squash(x)
+float x;
+{
+  float m;
+  //x = -x;
+  //m = 1 + x + x*x/2 + x*x*x/6 + x*x*x*x/24 + x*x*x*x*x/120;
+  //return(1.0 / (1.0 + m));
+  return (1.0 / (1.0 + exp(-x)));
+}
+
+
+/*** Allocate 1d array of floats ***/
+
+float *alloc_1d_dbl(n)
+int n;
+{
+  float *new;
+
+  new = (float *) malloc ((unsigned) (n * sizeof (float)));
+  if (new == NULL) {
+    printf("ALLOC_1D_DBL: Couldn't allocate array of floats\n");
+    return (NULL);
+  }
+  return (new);
+}
+
+
+/*** Allocate 2d array of floats ***/
+
+float **alloc_2d_dbl(m, n)
+int m, n;
+{
+  int i;
+  float **new;
+
+  new = (float **) malloc ((unsigned) (m * sizeof (float *)));
+  if (new == NULL) {
+    printf("ALLOC_2D_DBL: Couldn't allocate array of dbl ptrs\n");
+    return (NULL);
+  }
+
+  for (i = 0; i < m; i++) {
+    new[i] = alloc_1d_dbl(n);
+  }
+
+  return (new);
+}
+
+
+bpnn_randomize_weights(w, m, n)
+float **w;
+int m, n;
+{
+  int i, j;
+
+  for (i = 0; i <= m; i++) {
+    for (j = 0; j <= n; j++) {
+     w[i][j] = (float) rand()/RAND_MAX;
+    //  w[i][j] = dpn1();
+    }
+  }
+}
+
+bpnn_randomize_row(w, m)
+float *w;
+int m;
+{
+	int i;
+	for (i = 0; i <= m; i++) {
+     //w[i] = (float) rand()/RAND_MAX;
+	 w[i] = 0.1;
+    }
+}
+
+
+bpnn_zero_weights(w, m, n)
+float **w;
+int m, n;
+{
+  int i, j;
+
+  for (i = 0; i <= m; i++) {
+    for (j = 0; j <= n; j++) {
+      w[i][j] = 0.0;
+    }
+  }
+}
+
+
+void bpnn_initialize(seed)
+{
+  printf("Random number generator seed: %d\n", seed);
+  srand(seed);
+}
+
+
+BPNN *bpnn_internal_create(n_in, n_hidden, n_out)
+int n_in, n_hidden, n_out;
+{
+  BPNN *newnet;
+
+  newnet = (BPNN *) malloc (sizeof (BPNN));
+  if (newnet == NULL) {
+    printf("BPNN_CREATE: Couldn't allocate neural network\n");
+    return (NULL);
+  }
+
+  newnet->input_n = n_in;
+  newnet->hidden_n = n_hidden;
+  newnet->output_n = n_out;
+  newnet->input_units = alloc_1d_dbl(n_in + 1);
+  newnet->hidden_units = alloc_1d_dbl(n_hidden + 1);
+  newnet->output_units = alloc_1d_dbl(n_out + 1);
+
+  newnet->hidden_delta = alloc_1d_dbl(n_hidden + 1);
+  newnet->output_delta = alloc_1d_dbl(n_out + 1);
+  newnet->target = alloc_1d_dbl(n_out + 1);
+
+  newnet->input_weights = alloc_2d_dbl(n_in + 1, n_hidden + 1);
+  newnet->hidden_weights = alloc_2d_dbl(n_hidden + 1, n_out + 1);
+
+  newnet->input_prev_weights = alloc_2d_dbl(n_in + 1, n_hidden + 1);
+  newnet->hidden_prev_weights = alloc_2d_dbl(n_hidden + 1, n_out + 1);
+
+  return (newnet);
+}
+
+
+void bpnn_free(net)
+BPNN *net;
+{
+  int n1, n2, i;
+
+  n1 = net->input_n;
+  n2 = net->hidden_n;
+
+  free((char *) net->input_units);
+  free((char *) net->hidden_units);
+  free((char *) net->output_units);
+
+  free((char *) net->hidden_delta);
+  free((char *) net->output_delta);
+  free((char *) net->target);
+
+  for (i = 0; i <= n1; i++) {
+    free((char *) net->input_weights[i]);
+    free((char *) net->input_prev_weights[i]);
+  }
+  free((char *) net->input_weights);
+  free((char *) net->input_prev_weights);
+
+  for (i = 0; i <= n2; i++) {
+    free((char *) net->hidden_weights[i]);
+    free((char *) net->hidden_prev_weights[i]);
+  }
+  free((char *) net->hidden_weights);
+  free((char *) net->hidden_prev_weights);
+
+  free((char *) net);
+}
+
+
+/*** Creates a new fully-connected network from scratch,
+     with the given numbers of input, hidden, and output units.
+     Threshold units are automatically included.  All weights are
+     randomly initialized.
+
+     Space is also allocated for temporary storage (momentum weights,
+     error computations, etc).
+***/
+
+BPNN *bpnn_create(n_in, n_hidden, n_out)
+int n_in, n_hidden, n_out;
+{
+
+  BPNN *newnet;
+
+  newnet = bpnn_internal_create(n_in, n_hidden, n_out);
+
+#ifdef INITZERO
+
+---FILE-END---
+#ifdef INITZERO
+  bpnn_zero_weights(newnet->input_weights, n_in, n_hidden);
+#else
+  bpnn_randomize_weights(newnet->input_weights, n_in, n_hidden);
+#endif
+  bpnn_randomize_weights(newnet->hidden_weights, n_hidden, n_out);
+  bpnn_zero_weights(newnet->input_prev_weights, n_in, n_hidden);
+  bpnn_zero_weights(newnet->hidden_prev_weights, n_hidden, n_out);
+  bpnn_randomize_row(newnet->target, n_out);
+  return (newnet);
+}
+
+
+void bpnn_layerforward(l1, l2, conn, n1, n2)
+float *l1, *l2, **conn;
+int n1, n2;
+{
+  float sum;
+  int j, k;
+
+  /*** Set up thresholding unit ***/
+  l1[0] = 1.0;
+  /*** For each unit in second layer ***/
+  for (j = 1; j <= n2; j++) {
+
+    /*** Compute weighted sum of its inputs ***/
+    sum = 0.0;
+    for (k = 0; k <= n1; k++) {	
+      sum += conn[k][j] * l1[k]; 
+    }
+    l2[j] = squash(sum);
+  }
+}
+
+//extern "C"
+void bpnn_output_error(delta, target, output, nj, err)  
+float *delta, *target, *output, *err;
+int nj;
+{
+  int j;
+  float o, t, errsum;
+  errsum = 0.0;
+  for (j = 1; j <= nj; j++) {
+    o = output[j];
+    t = target[j];
+    delta[j] = o * (1.0 - o) * (t - o);
+    errsum += ABS(delta[j]);
+  }
+  *err = errsum;
+}
+
+
+void bpnn_hidden_error(delta_h,   
+					   nh, 
+					   delta_o, 
+					   no, 
+					   who, 
+					   hidden, 
+					   err)
+float *delta_h, *delta_o, *hidden, **who, *err;
+int nh, no;
+{
+  int j, k;
+  float h, sum, errsum;
+
+  errsum = 0.0;
+  for (j = 1; j <= nh; j++) {
+    h = hidden[j];
+    sum = 0.0;
+    for (k = 1; k <= no; k++) {
+      sum += delta_o[k] * who[j][k];
+    }
+    delta_h[j] = h * (1.0 - h) * sum;
+    errsum += ABS(delta_h[j]);
+  }
+  *err = errsum;
+}
+
+
+void bpnn_adjust_weights(delta, ndelta, ly, nly, w, oldw)
+float *delta, *ly, **w, **oldw;
+{
+  float new_dw;
+  int k, j;
+  ly[0] = 1.0;
+  //eta = 0.3;
+  //momentum = 0.3;
+
+  for (j = 1; j <= ndelta; j++) {
+    for (k = 0; k <= nly; k++) {
+      new_dw = ((ETA * delta[j] * ly[k]) + (MOMENTUM * oldw[k][j]));
+	  w[k][j] += new_dw;
+	  oldw[k][j] = new_dw;
+    }
+  }
+}
+
+
+void bpnn_feedforward(net)
+BPNN *net;
+{
+  int in, hid, out;
+
+  in = net->input_n;
+  hid = net->hidden_n;
+  out = net->output_n;
+
+  /*** Feed forward input activations. ***/
+  bpnn_layerforward(net->input_units, net->hidden_units,
+      net->input_weights, in, hid);
+  bpnn_layerforward(net->hidden_units, net->output_units,
+      net->hidden_weights, hid, out);
+
+}
+
+
+void bpnn_train(net, eo, eh)
+BPNN *net;
+float *eo, *eh;
+{
+  int in, hid, out;
+  float out_err, hid_err;
+
+  in = net->input_n;
+  hid = net->hidden_n;
+  out = net->output_n;
+
+  /*** Feed forward input activations. ***/
+  bpnn_layerforward(net->input_units, net->hidden_units,
+      net->input_weights, in, hid);
+  bpnn_layerforward(net->hidden_units, net->output_units,
+      net->hidden_weights, hid, out);
+
+  /*** Compute error on output and hidden units. ***/
+  bpnn_output_error(net->output_delta, net->target, net->output_units,
+      out, &out_err);
+  bpnn_hidden_error(net->hidden_delta, hid, net->output_delta, out,
+      net->hidden_weights, net->hidden_units, &hid_err);
+  *eo = out_err;
+  *eh = hid_err;
+
+  /*** Adjust input and hidden weights. ***/
+  bpnn_adjust_weights(net->output_delta, out, net->hidden_units, hid,
+      net->hidden_weights, net->hidden_prev_weights);
+  bpnn_adjust_weights(net->hidden_delta, hid, net->input_units, in,
+      net->input_weights, net->input_prev_weights);
+
+}
+
+
+
+
+void bpnn_save(net, filename)
+BPNN *net;
+char *filename;
+{
+  int n1, n2, n3, i, j, memcnt;
+  float dvalue, **w;
+  char *mem;
+  ///add//
+  FILE *pFile;
+  pFile = fopen( filename, "w+" );
+  ///////
+  /*
+  if ((fd = creat(filename, 0644)) == -1) {
+    printf("BPNN_SAVE: Cannot create '%s'\n", filename);
+    return;
+  }
+  */
+
+  n1 = net->input_n;  n2 = net->hidden_n;  n3 = net->output_n;
+  printf("Saving %dx%dx%d network to '%s'\n", n1, n2, n3, filename);
+  //fflush(stdout);
+
+  //write(fd, (char *) &n1, sizeof(int));
+  //write(fd, (char *) &n2, sizeof(int));
+  //write(fd, (char *) &n3, sizeof(int));
+
+  fwrite( (char *) &n1 , sizeof(char), sizeof(char), pFile);
+  fwrite( (char *) &n2 , sizeof(char), sizeof(char), pFile);
+  fwrite( (char *) &n3 , sizeof(char), sizeof(char), pFile);
+
+  
+
+  memcnt = 0;
+  w = net->input_weights;
+  mem = (char *) malloc ((unsigned) ((n1+1) * (n2+1) * sizeof(float)));
+  for (i = 0; i <= n1; i++) {
+    for (j = 0; j <= n2; j++) {
+      dvalue = w[i][j];
+      fastcopy(&mem[memcnt], &dvalue, sizeof(float));
+      memcnt += sizeof(float);
+    }
+  }
+  //write(fd, mem, (n1+1) * (n2+1) * sizeof(float));
+  fwrite( mem , (unsigned)(sizeof(float)), (unsigned) ((n1+1) * (n2+1) * sizeof(float)) , pFile);
+  free(mem);
+
+  memcnt = 0;
+  w = net->hidden_weights;
+  mem = (char *) malloc ((unsigned) ((n2+1) * (n3+1) * sizeof(float)));
+
+[shell] $ /bin/bash -lc "sed -n '1,220p' data/src/backprop-omp/backprop_kernel.c && printf '\\n---FILE-END---\\n' && sed -n '1,220p' data/src/backprop-omp/facetrain.c && printf '\\n---FILE-END---\\n' && sed -n '1,220p' data/src/backprop-omp/backprop.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <sys/time.h>
+
+#include "backprop.h"
+
+////////////////////////////////////////////////////////////////////////////////
+
+extern void bpnn_layerforward(float *l1, float *l2, float **conn, int n1, int n2);
+
+extern void bpnn_output_error(float *delta, float *target, float *output, int nj, float *err);
+
+extern void bpnn_hidden_error(float *delta_h, int nh, float *delta_o, int no, float **who, float *hidden, float *err);
+
+extern void bpnn_adjust_weights(float *delta, int ndelta, float *ly, int nly, float **w, float **oldw);
+
+
+extern int setup(int argc, char** argv);
+
+extern float **alloc_2d_dbl(int m, int n);
+
+extern float squash(float x);
+
+double gettime() {
+  struct timeval t;
+  gettimeofday(&t,NULL);
+  return t.tv_sec+t.tv_usec*1e-6;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Program main
+////////////////////////////////////////////////////////////////////////////////
+int
+main( int argc, char** argv) 
+{
+	setup(argc, argv);
+}
+
+
+void bpnn_train_kernel(BPNN *net, float *eo, float *eh)
+{
+  int in, hid, out;
+  float out_err, hid_err;
+  
+  in = net->input_n;
+  hid = net->hidden_n;
+  out = net->output_n;   
+   
+  printf("Performing CPU computation\n");
+  bpnn_layerforward(net->input_units, net->hidden_units,net->input_weights, in, hid);
+  bpnn_layerforward(net->hidden_units, net->output_units, net->hidden_weights, hid, out);
+  bpnn_output_error(net->output_delta, net->target, net->output_units, out, &out_err);
+  bpnn_hidden_error(net->hidden_delta, hid, net->output_delta, out, net->hidden_weights, net->hidden_units, &hid_err);  
+  bpnn_adjust_weights(net->output_delta, out, net->hidden_units, hid, net->hidden_weights, net->hidden_prev_weights);
+  bpnn_adjust_weights(net->hidden_delta, hid, net->input_units, in, net->input_weights, net->input_prev_weights);
+
+}
+
+---FILE-END---
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include "backprop.h"
+#include "omp.h"
+
+extern char *strcpy();
+extern void exit();
+
+int layer_size = 0;
+
+backprop_face()
+{
+  BPNN *net;
+  int i;
+  float out_err, hid_err;
+  net = bpnn_create(layer_size, 16, 1); // (16, 1 can not be changed)
+  printf("Input layer size : %d\n", layer_size);
+  load(net);
+  //entering the training kernel, only one iteration
+  printf("Starting training kernel\n");
+  bpnn_train_kernel(net, &out_err, &hid_err);
+  bpnn_free(net);
+  printf("Training done\n");
+}
+
+int setup(argc, argv)
+int argc;
+char *argv[];
+{
+  if(argc!=2){
+  fprintf(stderr, "usage: backprop <num of input elements>\n");
+  exit(0);
+  }
+
+  layer_size = atoi(argv[1]);
+  
+  int seed;
+
+  seed = 7;   
+  bpnn_initialize(seed);
+  backprop_face();
+
+  exit(0);
+}
+
+---FILE-END---
+#ifndef _BACKPROP_H_
+#define _BACKPROP_H_
+
+#define BIGRND 0x7fffffff
+
+
+#define ETA 0.3       //eta value
+#define MOMENTUM 0.3  //momentum value
+#define NUM_THREAD 8 //OpenMP threads
+
+
+typedef struct {
+  int input_n;                  /* number of input units */
+  int hidden_n;                 /* number of hidden units */
+  int output_n;                 /* number of output units */
+
+  float *input_units;          /* the input units */
+  float *hidden_units;         /* the hidden units */
+  float *output_units;         /* the output units */
+
+  float *hidden_delta;         /* storage for hidden unit error */
+  float *output_delta;         /* storage for output unit error */
+
+  float *target;               /* storage for target vector */
+
+  float **input_weights;       /* weights from input to hidden layer */
+  float **hidden_weights;      /* weights from hidden to output layer */
+
+                                /*** The next two are for momentum ***/
+  float **input_prev_weights;  /* previous change on input to hidden wgt */
+  float **hidden_prev_weights; /* previous change on hidden to output wgt */
+} BPNN;
+
+
+/*** User-level functions ***/
+
+void bpnn_initialize();
+
+BPNN *bpnn_create();
+void bpnn_free();
+
+void bpnn_train();
+void bpnn_feedforward();
+
+void bpnn_save();
+BPNN *bpnn_read();
+
+
+#endif
+
+[file_update] /root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/backprop.h
+[shell] $ /bin/bash -lc "sed -n '1,20p' data/src/backprop-omp/facetrain.c | sed -n '1,20p' -n"
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include "backprop.h"
+#include "omp.h"
+
+extern char *strcpy();
+extern void exit();
+
+int layer_size = 0;
+
+backprop_face()
+{
+  BPNN *net;
+  int i;
+  float out_err, hid_err;
+  net = bpnn_create(layer_size, 16, 1); // (16, 1 can not be changed)
+  printf("Input layer size : %d\n", layer_size);
+  load(net);
+  //entering the training kernel, only one iteration
+
+[file_update] /root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/facetrain.c
+[file_update] /root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/backprop_kernel.c
+[file_update] /root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/backprop.c
+[shell] $ /bin/bash -lc "sed -n '1,220p' data/src/backprop-omp/backprop_kernel.c | tail -n 60"
+        sum += input_weights[(k * input_cols) + j] * input_units[k];
+      }
+      hidden_units[j] = squash(sum);
+    }
+
+    hidden_units[0] = 1.0f;
+
+    #pragma omp target teams distribute parallel for private(k)
+    for (j = 1; j <= out; ++j) {
+      float sum = 0.0f;
+      for (k = 0; k <= hid; ++k) {
+        sum += hidden_weights[(k * hidden_cols) + j] * hidden_units[k];
+      }
+      output_units[j] = squash(sum);
+    }
+
+    out_err = 0.0f;
+    #pragma omp target teams distribute parallel for reduction(+:out_err)
+    for (j = 1; j <= out; ++j) {
+      float o = output_units[j];
+      float t = target[j];
+      output_delta[j] = o * (1.0f - o) * (t - o);
+      out_err += fabsf(output_delta[j]);
+    }
+
+    hid_err = 0.0f;
+    #pragma omp target teams distribute parallel for reduction(+:hid_err)
+    for (j = 1; j <= hid; ++j) {
+      float h = hidden_units[j];
+      float sum = 0.0f;
+      for (k = 1; k <= out; ++k) {
+        sum += output_delta[k] * hidden_weights[(j * hidden_cols) + k];
+      }
+      hidden_delta[j] = h * (1.0f - h) * sum;
+      hid_err += fabsf(hidden_delta[j]);
+    }
+
+    #pragma omp target teams distribute parallel for collapse(2)
+    for (j = 1; j <= out; ++j) {
+      for (k = 0; k <= hid; ++k) {
+        float new_dw = ((ETA * output_delta[j] * hidden_units[k]) + (MOMENTUM * hidden_prev_weights[(k * hidden_cols) + j]));
+        hidden_weights[(k * hidden_cols) + j] += new_dw;
+        hidden_prev_weights[(k * hidden_cols) + j] = new_dw;
+      }
+    }
+
+    #pragma omp target teams distribute parallel for collapse(2)
+    for (j = 1; j <= hid; ++j) {
+      for (k = 0; k <= in; ++k) {
+        float new_dw = ((ETA * hidden_delta[j] * input_units[k]) + (MOMENTUM * input_prev_weights[(k * input_cols) + j]));
+        input_weights[(k * input_cols) + j] += new_dw;
+        input_prev_weights[(k * input_cols) + j] = new_dw;
+      }
+    }
+  }
+
+  *eo = out_err;
+  *eh = hid_err;
+
+}
+
+[shell] $ /bin/bash -lc "sed -n '1,220p' data/src/backprop-omp/imagenet.c"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "backprop.h"
+
+extern layer_size;
+
+load(net)
+BPNN *net;
+{
+  float *units;
+  int nr, nc, imgsize, i, j, k;
+
+  nr = layer_size;
+  
+  imgsize = nr * nc;
+  units = net->input_units;
+
+  k = 1;
+  for (i = 0; i < nr; i++) {
+	  units[k] = (float) rand()/RAND_MAX ;
+	  k++;
+    }
+}
+
+[shell] $ /bin/bash -lc "sed -n '1,60p' data/src/backprop-omp/backprop_kernel.c"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <sys/time.h>
+
+#include "backprop.h"
+
+////////////////////////////////////////////////////////////////////////////////
+
+extern void bpnn_layerforward(float *l1, float *l2, float **conn, int n1, int n2);
+
+extern void bpnn_output_error(float *delta, float *target, float *output, int nj, float *err);
+
+extern void bpnn_hidden_error(float *delta_h, int nh, float *delta_o, int no, float **who, float *hidden, float *err);
+
+extern void bpnn_adjust_weights(float *delta, int ndelta, float *ly, int nly, float **w, float **oldw);
+
+
+extern int setup(int argc, char** argv);
+
+extern float **alloc_2d_dbl(int m, int n);
+
+extern float squash(float x);
+
+double gettime() {
+  struct timeval t;
+  gettimeofday(&t,NULL);
+  return t.tv_sec+t.tv_usec*1e-6;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Program main
+////////////////////////////////////////////////////////////////////////////////
+int
+main( int argc, char** argv) 
+{
+	setup(argc, argv);
+}
+
+
+void bpnn_train_kernel(BPNN *net, float *eo, float *eh)
+{
+  int in, hid, out;
+  int input_cols, hidden_cols;
+  int j, k;
+  float out_err, hid_err;
+  float *input_units;
+  float *hidden_units;
+  float *output_units;
+  float *hidden_delta;
+  float *output_delta;
+  float *target;
+  float *input_weights;
+  float *hidden_weights;
+  float *input_prev_weights;
+  float *hidden_prev_weights;
+  
+  in = net->input_n;
+  hid = net->hidden_n;
+
+[file_update] /root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/imagenet.c
+[file_update] /root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/Makefile.nvc
+The main translation is in place now: the training kernel uses target offload, and the weight matrices are contiguous so the device can address them safely. I’m doing a quick source audit for any remaining build hazards before I clean and compile with the exact NVC Makefile.
+[shell] $ /bin/bash -lc "sed -n '1,120p' data/src/backprop-omp/backprop.c && printf '\\n---\\n' && sed -n '120,220p' data/src/backprop-omp/backprop.c && printf '\\n---\\n' && sed -n '220,360p' data/src/backprop-omp/backprop.c"
+/*
+ ******************************************************************
+ * HISTORY
+ * 15-Oct-94  Jeff Shufelt (js), Carnegie Mellon University
+ *	Prepared for 15-681, Fall 1994.
+ * Modified by Shuai Che
+ ******************************************************************
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "backprop.h"
+#include <math.h>
+#include <omp.h>
+
+#define ABS(x)          (((x) > 0.0) ? (x) : (-(x)))
+
+#define fastcopy(to,from,len)\
+{\
+  register char *_to,*_from;\
+  register int _i,_l;\
+  _to = (char *)(to);\
+  _from = (char *)(from);\
+  _l = (len);\
+  for (_i = 0; _i < _l; _i++) *_to++ = *_from++;\
+}
+
+/*** Return random number between 0.0 and 1.0 ***/
+float drnd()
+{
+  return ((float) rand() / (float) BIGRND);
+}
+
+/*** Return random number between -1.0 and 1.0 ***/
+float dpn1()
+{
+  return ((drnd() * 2.0) - 1.0);
+}
+
+/*** The squashing function.  Currently, it's a sigmoid. ***/
+
+#pragma omp declare target
+float squash(x)
+float x;
+{
+  return (1.0 / (1.0 + exp(-x)));
+}
+#pragma omp end declare target
+
+
+/*** Allocate 1d array of floats ***/
+
+float *alloc_1d_dbl(n)
+int n;
+{
+  float *new;
+
+  new = (float *) malloc ((unsigned) (n * sizeof (float)));
+  if (new == NULL) {
+    printf("ALLOC_1D_DBL: Couldn't allocate array of floats\n");
+    return (NULL);
+  }
+  return (new);
+}
+
+
+/*** Allocate 2d array of floats ***/
+
+float **alloc_2d_dbl(m, n)
+int m, n;
+{
+  int i;
+  float **new;
+  float *data;
+
+  new = (float **) malloc ((unsigned) (m * sizeof (float *)));
+  if (new == NULL) {
+    printf("ALLOC_2D_DBL: Couldn't allocate array of dbl ptrs\n");
+    return (NULL);
+  }
+
+  data = (float *) malloc ((unsigned) (m * n * sizeof (float)));
+  if (data == NULL) {
+    printf("ALLOC_2D_DBL: Couldn't allocate array of floats\n");
+    free((char *) new);
+    return (NULL);
+  }
+
+  for (i = 0; i < m; i++) {
+    new[i] = data + (i * n);
+  }
+
+  return (new);
+}
+
+
+bpnn_randomize_weights(w, m, n)
+float **w;
+int m, n;
+{
+  int i, j;
+
+  for (i = 0; i <= m; i++) {
+    for (j = 0; j <= n; j++) {
+     w[i][j] = (float) rand()/RAND_MAX;
+    //  w[i][j] = dpn1();
+    }
+  }
+}
+
+bpnn_randomize_row(w, m)
+float *w;
+int m;
+{
+	int i;
+	for (i = 0; i <= m; i++) {
+     //w[i] = (float) rand()/RAND_MAX;
+	 w[i] = 0.1;
+    }
+}
+
+---
+}
+
+
+bpnn_zero_weights(w, m, n)
+float **w;
+int m, n;
+{
+  int i, j;
+
+  for (i = 0; i <= m; i++) {
+    for (j = 0; j <= n; j++) {
+      w[i][j] = 0.0;
+    }
+  }
+}
+
+
+void bpnn_initialize(seed)
+{
+  printf("Random number generator seed: %d\n", seed);
+  srand(seed);
+}
+
+
+BPNN *bpnn_internal_create(n_in, n_hidden, n_out)
+int n_in, n_hidden, n_out;
+{
+  BPNN *newnet;
+
+  newnet = (BPNN *) malloc (sizeof (BPNN));
+  if (newnet == NULL) {
+    printf("BPNN_CREATE: Couldn't allocate neural network\n");
+    return (NULL);
+  }
+
+  newnet->input_n = n_in;
+  newnet->hidden_n = n_hidden;
+  newnet->output_n = n_out;
+  newnet->input_units = alloc_1d_dbl(n_in + 1);
+  newnet->hidden_units = alloc_1d_dbl(n_hidden + 1);
+  newnet->output_units = alloc_1d_dbl(n_out + 1);
+
+  newnet->hidden_delta = alloc_1d_dbl(n_hidden + 1);
+  newnet->output_delta = alloc_1d_dbl(n_out + 1);
+  newnet->target = alloc_1d_dbl(n_out + 1);
+
+  newnet->input_weights = alloc_2d_dbl(n_in + 1, n_hidden + 1);
+  newnet->hidden_weights = alloc_2d_dbl(n_hidden + 1, n_out + 1);
+
+  newnet->input_prev_weights = alloc_2d_dbl(n_in + 1, n_hidden + 1);
+  newnet->hidden_prev_weights = alloc_2d_dbl(n_hidden + 1, n_out + 1);
+
+  return (newnet);
+}
+
+
+void bpnn_free(net)
+BPNN *net;
+{
+  int n1, n2, i;
+
+  n1 = net->input_n;
+  n2 = net->hidden_n;
+
+  free((char *) net->input_units);
+  free((char *) net->hidden_units);
+  free((char *) net->output_units);
+
+  free((char *) net->hidden_delta);
+  free((char *) net->output_delta);
+  free((char *) net->target);
+
+  free((char *) net->input_weights[0]);
+  free((char *) net->input_prev_weights[0]);
+  free((char *) net->input_weights);
+  free((char *) net->input_prev_weights);
+
+  free((char *) net->hidden_weights[0]);
+  free((char *) net->hidden_prev_weights[0]);
+  free((char *) net->hidden_weights);
+  free((char *) net->hidden_prev_weights);
+
+  free((char *) net);
+}
+
+
+/*** Creates a new fully-connected network from scratch,
+     with the given numbers of input, hidden, and output units.
+     Threshold units are automatically included.  All weights are
+     randomly initialized.
+
+     Space is also allocated for temporary storage (momentum weights,
+     error computations, etc).
+***/
+
+BPNN *bpnn_create(n_in, n_hidden, n_out)
+int n_in, n_hidden, n_out;
+{
+
+  BPNN *newnet;
+
+
+---
+
+  newnet = bpnn_internal_create(n_in, n_hidden, n_out);
+
+#ifdef INITZERO
+  bpnn_zero_weights(newnet->input_weights, n_in, n_hidden);
+#else
+  bpnn_randomize_weights(newnet->input_weights, n_in, n_hidden);
+#endif
+  bpnn_randomize_weights(newnet->hidden_weights, n_hidden, n_out);
+  bpnn_zero_weights(newnet->input_prev_weights, n_in, n_hidden);
+  bpnn_zero_weights(newnet->hidden_prev_weights, n_hidden, n_out);
+  bpnn_randomize_row(newnet->target, n_out);
+  return (newnet);
+}
+
+
+void bpnn_layerforward(l1, l2, conn, n1, n2)
+float *l1, *l2, **conn;
+int n1, n2;
+{
+  float sum;
+  int j, k;
+
+  /*** Set up thresholding unit ***/
+  l1[0] = 1.0;
+  /*** For each unit in second layer ***/
+  for (j = 1; j <= n2; j++) {
+
+    /*** Compute weighted sum of its inputs ***/
+    sum = 0.0;
+    for (k = 0; k <= n1; k++) {	
+      sum += conn[k][j] * l1[k]; 
+    }
+    l2[j] = squash(sum);
+  }
+}
+
+//extern "C"
+void bpnn_output_error(delta, target, output, nj, err)  
+float *delta, *target, *output, *err;
+int nj;
+{
+  int j;
+  float o, t, errsum;
+  errsum = 0.0;
+  for (j = 1; j <= nj; j++) {
+    o = output[j];
+    t = target[j];
+    delta[j] = o * (1.0 - o) * (t - o);
+    errsum += ABS(delta[j]);
+  }
+  *err = errsum;
+}
+
+
+void bpnn_hidden_error(delta_h,   
+					   nh, 
+					   delta_o, 
+					   no, 
+					   who, 
+					   hidden, 
+					   err)
+float *delta_h, *delta_o, *hidden, **who, *err;
+int nh, no;
+{
+  int j, k;
+  float h, sum, errsum;
+
+  errsum = 0.0;
+  for (j = 1; j <= nh; j++) {
+    h = hidden[j];
+    sum = 0.0;
+    for (k = 1; k <= no; k++) {
+      sum += delta_o[k] * who[j][k];
+    }
+    delta_h[j] = h * (1.0 - h) * sum;
+    errsum += ABS(delta_h[j]);
+  }
+  *err = errsum;
+}
+
+
+void bpnn_adjust_weights(delta, ndelta, ly, nly, w, oldw)
+float *delta, *ly, **w, **oldw;
+{
+  float new_dw;
+  int k, j;
+  ly[0] = 1.0;
+  //eta = 0.3;
+  //momentum = 0.3;
+
+  for (j = 1; j <= ndelta; j++) {
+    for (k = 0; k <= nly; k++) {
+      new_dw = ((ETA * delta[j] * ly[k]) + (MOMENTUM * oldw[k][j]));
+	  w[k][j] += new_dw;
+	  oldw[k][j] = new_dw;
+    }
+  }
+}
+
+
+void bpnn_feedforward(net)
+BPNN *net;
+{
+  int in, hid, out;
+
+  in = net->input_n;
+  hid = net->hidden_n;
+  out = net->output_n;
+
+  /*** Feed forward input activations. ***/
+  bpnn_layerforward(net->input_units, net->hidden_units,
+      net->input_weights, in, hid);
+  bpnn_layerforward(net->hidden_units, net->output_units,
+      net->hidden_weights, hid, out);
+
+}
+
+
+void bpnn_train(net, eo, eh)
+BPNN *net;
+float *eo, *eh;
+{
+  int in, hid, out;
+  float out_err, hid_err;
+
+  in = net->input_n;
+  hid = net->hidden_n;
+  out = net->output_n;
+
+  /*** Feed forward input activations. ***/
+  bpnn_layerforward(net->input_units, net->hidden_units,
+      net->input_weights, in, hid);
+  bpnn_layerforward(net->hidden_units, net->output_units,
+      net->hidden_weights, hid, out);
+
+  /*** Compute error on output and hidden units. ***/
+  bpnn_output_error(net->output_delta, net->target, net->output_units,
+      out, &out_err);
+  bpnn_hidden_error(net->hidden_delta, hid, net->output_delta, out,
+      net->hidden_weights, net->hidden_units, &hid_err);
+
+[shell] $ /bin/bash -lc "sed -n '1,200p' data/src/backprop-omp/Makefile.nvc && printf '\\n---\\n' && sed -n '1,220p' data/src/backprop-omp/imagenet.c && printf '\\n---\\n' && sed -n '1,220p' data/src/backprop-omp/facetrain.c"
+# Makefile for backprop-serial (omp version)
+
+#===============================================================================
+# User Options
+#===============================================================================
+
+# Compiler can be set below, or via environment variable
+CC        = nvc
+OPTIMIZE  = yes
+DEBUG     = no
+DEVICE    = gpu
+SM        = cc89
+LAUNCHER  =
+GATE_ROOT ?= $(abspath ../..)
+REF_DIR   ?= $(GATE_ROOT)/golden_labels/src/backprop-serial
+REF_BIN   ?= $(REF_DIR)/backprop
+REF_MAKE  ?= Makefile.nvc
+
+RUN_ARGS ?= 65536
+
+#===============================================================================
+# Program name & source code list
+#===============================================================================
+
+program = backprop
+
+source = backprop.c facetrain.c imagenet.c backprop_kernel.c
+
+obj = $(source:.c=.o)
+
+#===============================================================================
+# Sets Flags
+#===============================================================================
+
+# Standard Flags
+CFLAGS := $(EXTRA_CFLAGS) -Wall -I$(GATE_ROOT)/gate_sdk
+LDFLAGS = -lm
+
+# Debug Flags
+ifeq ($(DEBUG),yes)
+  CFLAGS += -g -DDEBUG
+  LDFLAGS  += -g
+endif
+
+
+# Optimization Flags
+ifeq ($(OPTIMIZE),yes)
+  CFLAGS += -O3
+endif
+
+ifeq ($(DEVICE),gpu)
+  CFLAGS += -Minfo=mp -mp=gpu -gpu=$(SM)
+else
+  CFLAGS +=-qopenmp
+endif
+#===============================================================================
+# Targets to Build
+#===============================================================================
+
+$(program): $(obj)
+	$(CC) $(CFLAGS) $(obj) -o $@ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -rf $(program) $(obj)
+
+run: $(program)
+	$(LAUNCHER) ./$(program) $(RUN_ARGS)
+
+.PHONY: ref_build
+ref_build:
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) clean
+	$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) CC="$(CC)" OPTIMIZE="$(OPTIMIZE)" DEBUG="$(DEBUG)" DEVICE="$(DEVICE)" SM="$(SM)" CFLAGS="$(CFLAGS) -I$(GATE_ROOT)/gate_sdk"
+
+.PHONY: check-correctness
+check-correctness: $(program) ref_build
+	OMP_TARGET_OFFLOAD=MANDATORY python3 $(GATE_ROOT)/gate_sdk/scripts/gate_harness.py $(REF_BIN) ./$(program) $(RUN_ARGS)
+
+---
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "backprop.h"
+
+extern int layer_size;
+
+load(net)
+BPNN *net;
+{
+  float *units;
+  int nr, i, k;
+
+  nr = layer_size;
+  units = net->input_units;
+
+  units[0] = 1.0f;
+  k = 1;
+  for (i = 0; i < nr; i++) {
+	  units[k] = (float) rand()/RAND_MAX ;
+	  k++;
+    }
+}
+
+---
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include "backprop.h"
+
+extern char *strcpy();
+extern void exit();
+
+int layer_size = 0;
+
+backprop_face()
+{
+  BPNN *net;
+  int i;
+  float out_err, hid_err;
+  net = bpnn_create(layer_size, 16, 1); // (16, 1 can not be changed)
+  printf("Input layer size : %d\n", layer_size);
+  load(net);
+  //entering the training kernel, only one iteration
+  printf("Starting training kernel\n");
+  bpnn_train_kernel(net, &out_err, &hid_err);
+  bpnn_free(net);
+  printf("Training done\n");
+}
+
+int setup(argc, argv)
+int argc;
+char *argv[];
+{
+  if(argc!=2){
+  fprintf(stderr, "usage: backprop <num of input elements>\n");
+  exit(0);
+  }
+
+  layer_size = atoi(argv[1]);
+  
+  int seed;
+
+  seed = 7;   
+  bpnn_initialize(seed);
+  backprop_face();
+
+  exit(0);
+}
+
+[file_update] /root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/backprop_kernel.c
+I’ve finished the source edits and am moving to validation. First step is the mandated clean/build cycle under the target Makefile; if NVC reports any device mapping or syntax issues, I’ll patch the affected source and rebuild immediately.
+[shell] $ /bin/bash -lc 'set -e
+cd /root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp
+make -f Makefile.nvc clean > /tmp/backprop_clean.log 2>&1
+make -f Makefile.nvc > /tmp/backprop_build.log 2>&1 || { cat /tmp/backprop_build.log; exit 1; }
+cat /tmp/backprop_build.log'
+nvc  -Wall -I/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/gate_sdk -O3 -Minfo=mp -mp=gpu -gpu=cc89 -c backprop.c -o backprop.o
+"backprop.c", line 97: warning: explicit type is missing ("int" assumed) [missing_type_specifier]
+  bpnn_randomize_weights(w, m, n)
+  ^
+
+Remark: individual warnings can be suppressed with "--diag_suppress <warning-name>"
+
+"backprop.c", line 111: warning: explicit type is missing ("int" assumed) [missing_type_specifier]
+  bpnn_randomize_row(w, m)
+  ^
+
+"backprop.c", line 123: warning: explicit type is missing ("int" assumed) [missing_type_specifier]
+  bpnn_zero_weights(w, m, n)
+  ^
+
+"backprop.c", line 137: warning: standard requires that parameter "seed" be given a type by a subsequent declaration ("int" assumed) [undeclared_parameter]
+  void bpnn_initialize(seed)
+                       ^
+
+"backprop.c", line 179: warning: variable "n1" was set but never used [set_but_not_used]
+    int n1, n2, i;
+        ^
+
+"backprop.c", line 179: warning: variable "n2" was set but never used [set_but_not_used]
+    int n1, n2, i;
+            ^
+
+"backprop.c", line 179: warning: variable "i" was declared but never referenced [declared_but_not_referenced]
+    int n1, n2, i;
+                ^
+
+"backprop.c", line 302: warning: standard requires that parameter "ndelta" be given a type by a subsequent declaration ("int" assumed) [undeclared_parameter]
+  void bpnn_adjust_weights(delta, ndelta, ly, nly, w, oldw)
+                                  ^
+
+"backprop.c", line 302: warning: standard requires that parameter "nly" be given a type by a subsequent declaration ("int" assumed) [undeclared_parameter]
+  void bpnn_adjust_weights(delta, ndelta, ly, nly, w, oldw)
+                                              ^
+
+"backprop.c", line 447: warning: function "open" declared implicitly [implicit_func_decl]
+    if ((fd = open(filename, 0, 0644)) == -1) {
+              ^
+
+"backprop.c", line 453: warning: function "read" declared implicitly [implicit_func_decl]
+    read(fd, (char *) &n1, sizeof(int));
+    ^
+
+"backprop.c", line 484: warning: function "close" declared implicitly [implicit_func_decl]
+    close(fd);
+    ^
+
+squash:
+     45, Generating implicit omp declare target routine
+         Generating NVIDIA GPU code
+nvc  -Wall -I/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/gate_sdk -O3 -Minfo=mp -mp=gpu -gpu=cc89 -c facetrain.c -o facetrain.o
+"facetrain.c", line 11: warning: explicit type is missing ("int" assumed) [missing_type_specifier]
+  backprop_face()
+  ^
+
+Remark: individual warnings can be suppressed with "--diag_suppress <warning-name>"
+
+"facetrain.c", line 14: warning: variable "i" was declared but never referenced [declared_but_not_referenced]
+    int i;
+        ^
+
+nvc  -Wall -I/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/gate_sdk -O3 -Minfo=mp -mp=gpu -gpu=cc89 -c imagenet.c -o imagenet.o
+"imagenet.c", line 8: warning: explicit type is missing ("int" assumed) [missing_type_specifier]
+  load(net)
+  ^
+
+Remark: individual warnings can be suppressed with "--diag_suppress <warning-name>"
+
+"imagenet.c", line 8: error: declaration is incompatible with "void load(BPNN *)" (declared at line 42 of "backprop.h")
+  load(net)
+  ^
+
+1 error detected in the compilation of "imagenet.c".
+make: *** [Makefile.nvc:64: imagenet.o] Error 2
+
+The build failure is narrow: the `load` definition still uses K&R syntax while the header now declares a modern `void load(BPNN *)` prototype. I’m fixing that signature mismatch and leaving the rest of the historical C style intact so I don’t introduce unnecessary churn.
+[file_update] /root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/imagenet.c
+[shell] $ /bin/bash -lc 'set -e
+cd /root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp
+make -f Makefile.nvc clean > /tmp/backprop_clean.log 2>&1
+make -f Makefile.nvc > /tmp/backprop_build.log 2>&1 || { cat /tmp/backprop_build.log; exit 1; }
+cat /tmp/backprop_build.log'
+nvc  -Wall -I/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/gate_sdk -O3 -Minfo=mp -mp=gpu -gpu=cc89 -c backprop.c -o backprop.o
+"backprop.c", line 97: warning: explicit type is missing ("int" assumed) [missing_type_specifier]
+  bpnn_randomize_weights(w, m, n)
+  ^
+
+Remark: individual warnings can be suppressed with "--diag_suppress <warning-name>"
+
+"backprop.c", line 111: warning: explicit type is missing ("int" assumed) [missing_type_specifier]
+  bpnn_randomize_row(w, m)
+  ^
+
+"backprop.c", line 123: warning: explicit type is missing ("int" assumed) [missing_type_specifier]
+  bpnn_zero_weights(w, m, n)
+  ^
+
+"backprop.c", line 137: warning: standard requires that parameter "seed" be given a type by a subsequent declaration ("int" assumed) [undeclared_parameter]
+  void bpnn_initialize(seed)
+                       ^
+
+"backprop.c", line 179: warning: variable "n1" was set but never used [set_but_not_used]
+    int n1, n2, i;
+        ^
+
+"backprop.c", line 179: warning: variable "n2" was set but never used [set_but_not_used]
+    int n1, n2, i;
+            ^
+
+"backprop.c", line 179: warning: variable "i" was declared but never referenced [declared_but_not_referenced]
+    int n1, n2, i;
+                ^
+
+"backprop.c", line 302: warning: standard requires that parameter "ndelta" be given a type by a subsequent declaration ("int" assumed) [undeclared_parameter]
+  void bpnn_adjust_weights(delta, ndelta, ly, nly, w, oldw)
+                                  ^
+
+"backprop.c", line 302: warning: standard requires that parameter "nly" be given a type by a subsequent declaration ("int" assumed) [undeclared_parameter]
+  void bpnn_adjust_weights(delta, ndelta, ly, nly, w, oldw)
+                                              ^
+
+"backprop.c", line 447: warning: function "open" declared implicitly [implicit_func_decl]
+    if ((fd = open(filename, 0, 0644)) == -1) {
+              ^
+
+"backprop.c", line 453: warning: function "read" declared implicitly [implicit_func_decl]
+    read(fd, (char *) &n1, sizeof(int));
+    ^
+
+"backprop.c", line 484: warning: function "close" declared implicitly [implicit_func_decl]
+    close(fd);
+    ^
+
+squash:
+     45, Generating implicit omp declare target routine
+         Generating NVIDIA GPU code
+nvc  -Wall -I/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/gate_sdk -O3 -Minfo=mp -mp=gpu -gpu=cc89 -c facetrain.c -o facetrain.o
+"facetrain.c", line 11: warning: explicit type is missing ("int" assumed) [missing_type_specifier]
+  backprop_face()
+  ^
+
+Remark: individual warnings can be suppressed with "--diag_suppress <warning-name>"
+
+"facetrain.c", line 14: warning: variable "i" was declared but never referenced [declared_but_not_referenced]
+    int i;
+        ^
+
+nvc  -Wall -I/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/gate_sdk -O3 -Minfo=mp -mp=gpu -gpu=cc89 -c imagenet.c -o imagenet.o
+nvc  -Wall -I/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/gate_sdk -O3 -Minfo=mp -mp=gpu -gpu=cc89 -c backprop_kernel.c -o backprop_kernel.o
+bpnn_train_kernel:
+     85, #omp target teams distribute parallel for
+         85, Generating "nvkernel_bpnn_train_kernel_F1L85_2" GPU kernel
+             Loop parallelized across teams and threads(128), schedule(static)
+     96, #omp target teams distribute parallel for
+         96, Generating "nvkernel_bpnn_train_kernel_F1L96_4" GPU kernel
+             Loop parallelized across teams and threads(128), schedule(static)
+    106, #omp target teams distribute parallel for
+        106, Generating "nvkernel_bpnn_train_kernel_F1L106_6" GPU kernel
+             Loop parallelized across teams and threads(128), schedule(static)
+             Generating reduction(+:out_err)
+    115, #omp target teams distribute parallel for
+        115, Generating "nvkernel_bpnn_train_kernel_F1L115_8" GPU kernel
+             Loop parallelized across teams and threads(128), schedule(static)
+             Generating reduction(+:hid_err)
+    126, #omp target teams distribute parallel for
+        126, Generating "nvkernel_bpnn_train_kernel_F1L126_10" GPU kernel
+             Loop parallelized across teams and threads(128), schedule(static)
+    135, #omp target teams distribute parallel for
+        135, Generating "nvkernel_bpnn_train_kernel_F1L135_12" GPU kernel
+             Loop parallelized across teams and threads(128), schedule(static)
+nvc  -Wall -I/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/gate_sdk -O3 -Minfo=mp -mp=gpu -gpu=cc89 backprop.o facetrain.o imagenet.o backprop_kernel.o -o backprop -lm
+
+The offloaded build is green. I’m running the exact mandatory offload command now and checking that the training pass completes on the GPU rather than falling back to host execution.
+[shell] $ /bin/bash -lc 'set -e
+cd /root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp
+env OMP_TARGET_OFFLOAD=MANDATORY make -f Makefile.nvc run > /tmp/backprop_run.log 2>&1 || { cat /tmp/backprop_run.log; exit 1; }
+cat /tmp/backprop_run.log'
+./backprop 65536
+Random number generator seed: 7
+Input layer size : 65536
+Starting training kernel
+Performing GPU computation
+Training done
+
+[shell] $ /bin/bash -lc "nl -ba data/src/backprop-omp/backprop.c | sed -n '1,120p' && printf '\\n---\\n' && nl -ba data/src/backprop-omp/backprop.c | sed -n '140,220p' && printf '\\n---\\n' && nl -ba data/src/backprop-omp/backprop.c | sed -n '330,390p'"
+     1	/*
+     2	 ******************************************************************
+     3	 * HISTORY
+     4	 * 15-Oct-94  Jeff Shufelt (js), Carnegie Mellon University
+     5	 *	Prepared for 15-681, Fall 1994.
+     6	 * Modified by Shuai Che
+     7	 ******************************************************************
+     8	 */
+     9	
+    10	#include <stdio.h>
+    11	#include <stdlib.h>
+    12	#include "backprop.h"
+    13	#include <math.h>
+    14	#include <omp.h>
+    15	
+    16	#define ABS(x)          (((x) > 0.0) ? (x) : (-(x)))
+    17	
+    18	#define fastcopy(to,from,len)\
+    19	{\
+    20	  register char *_to,*_from;\
+    21	  register int _i,_l;\
+    22	  _to = (char *)(to);\
+    23	  _from = (char *)(from);\
+    24	  _l = (len);\
+    25	  for (_i = 0; _i < _l; _i++) *_to++ = *_from++;\
+    26	}
+    27	
+    28	/*** Return random number between 0.0 and 1.0 ***/
+    29	float drnd()
+    30	{
+    31	  return ((float) rand() / (float) BIGRND);
+    32	}
+    33	
+    34	/*** Return random number between -1.0 and 1.0 ***/
+    35	float dpn1()
+    36	{
+    37	  return ((drnd() * 2.0) - 1.0);
+    38	}
+    39	
+    40	/*** The squashing function.  Currently, it's a sigmoid. ***/
+    41	
+    42	#pragma omp declare target
+    43	float squash(x)
+    44	float x;
+    45	{
+    46	  return (1.0 / (1.0 + exp(-x)));
+    47	}
+    48	#pragma omp end declare target
+    49	
+    50	
+    51	/*** Allocate 1d array of floats ***/
+    52	
+    53	float *alloc_1d_dbl(n)
+    54	int n;
+    55	{
+    56	  float *new;
+    57	
+    58	  new = (float *) malloc ((unsigned) (n * sizeof (float)));
+    59	  if (new == NULL) {
+    60	    printf("ALLOC_1D_DBL: Couldn't allocate array of floats\n");
+    61	    return (NULL);
+    62	  }
+    63	  return (new);
+    64	}
+    65	
+    66	
+    67	/*** Allocate 2d array of floats ***/
+    68	
+    69	float **alloc_2d_dbl(m, n)
+    70	int m, n;
+    71	{
+    72	  int i;
+    73	  float **new;
+    74	  float *data;
+    75	
+    76	  new = (float **) malloc ((unsigned) (m * sizeof (float *)));
+    77	  if (new == NULL) {
+    78	    printf("ALLOC_2D_DBL: Couldn't allocate array of dbl ptrs\n");
+    79	    return (NULL);
+    80	  }
+    81	
+    82	  data = (float *) malloc ((unsigned) (m * n * sizeof (float)));
+    83	  if (data == NULL) {
+    84	    printf("ALLOC_2D_DBL: Couldn't allocate array of floats\n");
+    85	    free((char *) new);
+    86	    return (NULL);
+    87	  }
+    88	
+    89	  for (i = 0; i < m; i++) {
+    90	    new[i] = data + (i * n);
+    91	  }
+    92	
+    93	  return (new);
+    94	}
+    95	
+    96	
+    97	bpnn_randomize_weights(w, m, n)
+    98	float **w;
+    99	int m, n;
+   100	{
+   101	  int i, j;
+   102	
+   103	  for (i = 0; i <= m; i++) {
+   104	    for (j = 0; j <= n; j++) {
+   105	     w[i][j] = (float) rand()/RAND_MAX;
+   106	    //  w[i][j] = dpn1();
+   107	    }
+   108	  }
+   109	}
+   110	
+   111	bpnn_randomize_row(w, m)
+   112	float *w;
+   113	int m;
+   114	{
+   115		int i;
+   116		for (i = 0; i <= m; i++) {
+   117	     //w[i] = (float) rand()/RAND_MAX;
+   118		 w[i] = 0.1;
+   119	    }
+   120	}
+
+---
+   140	  srand(seed);
+   141	}
+   142	
+   143	
+   144	BPNN *bpnn_internal_create(n_in, n_hidden, n_out)
+   145	int n_in, n_hidden, n_out;
+   146	{
+   147	  BPNN *newnet;
+   148	
+   149	  newnet = (BPNN *) malloc (sizeof (BPNN));
+   150	  if (newnet == NULL) {
+   151	    printf("BPNN_CREATE: Couldn't allocate neural network\n");
+   152	    return (NULL);
+   153	  }
+   154	
+   155	  newnet->input_n = n_in;
+   156	  newnet->hidden_n = n_hidden;
+   157	  newnet->output_n = n_out;
+   158	  newnet->input_units = alloc_1d_dbl(n_in + 1);
+   159	  newnet->hidden_units = alloc_1d_dbl(n_hidden + 1);
+   160	  newnet->output_units = alloc_1d_dbl(n_out + 1);
+   161	
+   162	  newnet->hidden_delta = alloc_1d_dbl(n_hidden + 1);
+   163	  newnet->output_delta = alloc_1d_dbl(n_out + 1);
+   164	  newnet->target = alloc_1d_dbl(n_out + 1);
+   165	
+   166	  newnet->input_weights = alloc_2d_dbl(n_in + 1, n_hidden + 1);
+   167	  newnet->hidden_weights = alloc_2d_dbl(n_hidden + 1, n_out + 1);
+   168	
+   169	  newnet->input_prev_weights = alloc_2d_dbl(n_in + 1, n_hidden + 1);
+   170	  newnet->hidden_prev_weights = alloc_2d_dbl(n_hidden + 1, n_out + 1);
+   171	
+   172	  return (newnet);
+   173	}
+   174	
+   175	
+   176	void bpnn_free(net)
+   177	BPNN *net;
+   178	{
+   179	  int n1, n2, i;
+   180	
+   181	  n1 = net->input_n;
+   182	  n2 = net->hidden_n;
+   183	
+   184	  free((char *) net->input_units);
+   185	  free((char *) net->hidden_units);
+   186	  free((char *) net->output_units);
+   187	
+   188	  free((char *) net->hidden_delta);
+   189	  free((char *) net->output_delta);
+   190	  free((char *) net->target);
+   191	
+   192	  free((char *) net->input_weights[0]);
+   193	  free((char *) net->input_prev_weights[0]);
+   194	  free((char *) net->input_weights);
+   195	  free((char *) net->input_prev_weights);
+   196	
+   197	  free((char *) net->hidden_weights[0]);
+   198	  free((char *) net->hidden_prev_weights[0]);
+   199	  free((char *) net->hidden_weights);
+   200	  free((char *) net->hidden_prev_weights);
+   201	
+   202	  free((char *) net);
+   203	}
+   204	
+   205	
+   206	/*** Creates a new fully-connected network from scratch,
+   207	     with the given numbers of input, hidden, and output units.
+   208	     Threshold units are automatically included.  All weights are
+   209	     randomly initialized.
+   210	
+   211	     Space is also allocated for temporary storage (momentum weights,
+   212	     error computations, etc).
+   213	***/
+   214	
+   215	BPNN *bpnn_create(n_in, n_hidden, n_out)
+   216	int n_in, n_hidden, n_out;
+   217	{
+   218	
+   219	  BPNN *newnet;
+   220	
+
+---
+   330	  /*** Feed forward input activations. ***/
+   331	  bpnn_layerforward(net->input_units, net->hidden_units,
+   332	      net->input_weights, in, hid);
+   333	  bpnn_layerforward(net->hidden_units, net->output_units,
+   334	      net->hidden_weights, hid, out);
+   335	
+   336	}
+   337	
+   338	
+   339	void bpnn_train(net, eo, eh)
+   340	BPNN *net;
+   341	float *eo, *eh;
+   342	{
+   343	  int in, hid, out;
+   344	  float out_err, hid_err;
+   345	
+   346	  in = net->input_n;
+   347	  hid = net->hidden_n;
+   348	  out = net->output_n;
+   349	
+   350	  /*** Feed forward input activations. ***/
+   351	  bpnn_layerforward(net->input_units, net->hidden_units,
+   352	      net->input_weights, in, hid);
+   353	  bpnn_layerforward(net->hidden_units, net->output_units,
+   354	      net->hidden_weights, hid, out);
+   355	
+   356	  /*** Compute error on output and hidden units. ***/
+   357	  bpnn_output_error(net->output_delta, net->target, net->output_units,
+   358	      out, &out_err);
+   359	  bpnn_hidden_error(net->hidden_delta, hid, net->output_delta, out,
+   360	      net->hidden_weights, net->hidden_units, &hid_err);
+   361	  *eo = out_err;
+   362	  *eh = hid_err;
+   363	
+   364	  /*** Adjust input and hidden weights. ***/
+   365	  bpnn_adjust_weights(net->output_delta, out, net->hidden_units, hid,
+   366	      net->hidden_weights, net->hidden_prev_weights);
+   367	  bpnn_adjust_weights(net->hidden_delta, hid, net->input_units, in,
+   368	      net->input_weights, net->input_prev_weights);
+   369	
+   370	}
+   371	
+   372	
+   373	
+   374	
+   375	void bpnn_save(net, filename)
+   376	BPNN *net;
+   377	char *filename;
+   378	{
+   379	  int n1, n2, n3, i, j, memcnt;
+   380	  float dvalue, **w;
+   381	  char *mem;
+   382	  ///add//
+   383	  FILE *pFile;
+   384	  pFile = fopen( filename, "w+" );
+   385	  ///////
+   386	  /*
+   387	  if ((fd = creat(filename, 0644)) == -1) {
+   388	    printf("BPNN_SAVE: Cannot create '%s'\n", filename);
+   389	    return;
+   390	  }
+
+[shell] $ /bin/bash -lc "nl -ba data/src/backprop-omp/backprop_kernel.c | sed -n '1,220p' && printf '\\n---\\n' && nl -ba data/src/backprop-omp/imagenet.c | sed -n '1,120p' && printf '\\n---\\n' && nl -ba data/src/backprop-omp/Makefile.nvc | sed -n '1,120p'"
+     1	#include <stdlib.h>
+     2	#include <stdio.h>
+     3	#include <string.h>
+     4	#include <math.h>
+     5	#include <sys/time.h>
+     6	
+     7	#include "backprop.h"
+     8	
+     9	////////////////////////////////////////////////////////////////////////////////
+    10	
+    11	extern void bpnn_layerforward(float *l1, float *l2, float **conn, int n1, int n2);
+    12	
+    13	extern void bpnn_output_error(float *delta, float *target, float *output, int nj, float *err);
+    14	
+    15	extern void bpnn_hidden_error(float *delta_h, int nh, float *delta_o, int no, float **who, float *hidden, float *err);
+    16	
+    17	extern void bpnn_adjust_weights(float *delta, int ndelta, float *ly, int nly, float **w, float **oldw);
+    18	
+    19	
+    20	extern int setup(int argc, char** argv);
+    21	
+    22	extern float **alloc_2d_dbl(int m, int n);
+    23	
+    24	extern float squash(float x);
+    25	
+    26	double gettime() {
+    27	  struct timeval t;
+    28	  gettimeofday(&t,NULL);
+    29	  return t.tv_sec+t.tv_usec*1e-6;
+    30	}
+    31	
+    32	////////////////////////////////////////////////////////////////////////////////
+    33	// Program main
+    34	////////////////////////////////////////////////////////////////////////////////
+    35	int
+    36	main( int argc, char** argv) 
+    37	{
+    38		setup(argc, argv);
+    39	}
+    40	
+    41	
+    42	void bpnn_train_kernel(BPNN *net, float *eo, float *eh)
+    43	{
+    44	  int in, hid, out;
+    45	  int input_cols, hidden_cols;
+    46	  int j, k;
+    47	  float out_err, hid_err;
+    48	  float *input_units;
+    49	  float *hidden_units;
+    50	  float *output_units;
+    51	  float *hidden_delta;
+    52	  float *output_delta;
+    53	  float *target_units;
+    54	  float *input_weights;
+    55	  float *hidden_weights;
+    56	  float *input_prev_weights;
+    57	  float *hidden_prev_weights;
+    58	  
+    59	  in = net->input_n;
+    60	  hid = net->hidden_n;
+    61	  out = net->output_n;   
+    62	
+    63	  input_cols = hid + 1;
+    64	  hidden_cols = out + 1;
+    65	
+    66	  input_units = net->input_units;
+    67	  hidden_units = net->hidden_units;
+    68	  output_units = net->output_units;
+    69	  hidden_delta = net->hidden_delta;
+    70	  output_delta = net->output_delta;
+    71	  target_units = net->target;
+    72	  input_weights = net->input_weights[0];
+    73	  hidden_weights = net->hidden_weights[0];
+    74	  input_prev_weights = net->input_prev_weights[0];
+    75	  hidden_prev_weights = net->hidden_prev_weights[0];
+    76	
+    77	  printf("Performing GPU computation\n");
+    78	
+    79	  input_units[0] = 1.0f;
+    80	  hidden_units[0] = 1.0f;
+    81	
+    82	  #pragma omp target data map(to: input_units[0:(in + 1)], target_units[0:(out + 1)], input_weights[0:((in + 1) * (hid + 1))], hidden_weights[0:((hid + 1) * (out + 1))], input_prev_weights[0:((in + 1) * (hid + 1))], hidden_prev_weights[0:((hid + 1) * (out + 1))]) map(tofrom: hidden_units[0:(hid + 1)], output_units[0:(out + 1)], hidden_delta[0:(hid + 1)], output_delta[0:(out + 1)])
+    83	  {
+    84	    #pragma omp target teams distribute parallel for private(k)
+    85	    for (j = 1; j <= hid; ++j) {
+    86	      float sum = 0.0f;
+    87	      for (k = 0; k <= in; ++k) {
+    88	        sum += input_weights[(k * input_cols) + j] * input_units[k];
+    89	      }
+    90	      hidden_units[j] = squash(sum);
+    91	    }
+    92	
+    93	    hidden_units[0] = 1.0f;
+    94	
+    95	    #pragma omp target teams distribute parallel for private(k)
+    96	    for (j = 1; j <= out; ++j) {
+    97	      float sum = 0.0f;
+    98	      for (k = 0; k <= hid; ++k) {
+    99	        sum += hidden_weights[(k * hidden_cols) + j] * hidden_units[k];
+   100	      }
+   101	      output_units[j] = squash(sum);
+   102	    }
+   103	
+   104	    out_err = 0.0f;
+   105	    #pragma omp target teams distribute parallel for reduction(+:out_err)
+   106	    for (j = 1; j <= out; ++j) {
+   107	      float o = output_units[j];
+   108	      float t = target_units[j];
+   109	      output_delta[j] = o * (1.0f - o) * (t - o);
+   110	      out_err += fabsf(output_delta[j]);
+   111	    }
+   112	
+   113	    hid_err = 0.0f;
+   114	    #pragma omp target teams distribute parallel for reduction(+:hid_err)
+   115	    for (j = 1; j <= hid; ++j) {
+   116	      float h = hidden_units[j];
+   117	      float sum = 0.0f;
+   118	      for (k = 1; k <= out; ++k) {
+   119	        sum += output_delta[k] * hidden_weights[(j * hidden_cols) + k];
+   120	      }
+   121	      hidden_delta[j] = h * (1.0f - h) * sum;
+   122	      hid_err += fabsf(hidden_delta[j]);
+   123	    }
+   124	
+   125	    #pragma omp target teams distribute parallel for collapse(2)
+   126	    for (j = 1; j <= out; ++j) {
+   127	      for (k = 0; k <= hid; ++k) {
+   128	        float new_dw = ((ETA * output_delta[j] * hidden_units[k]) + (MOMENTUM * hidden_prev_weights[(k * hidden_cols) + j]));
+   129	        hidden_weights[(k * hidden_cols) + j] += new_dw;
+   130	        hidden_prev_weights[(k * hidden_cols) + j] = new_dw;
+   131	      }
+   132	    }
+   133	
+   134	    #pragma omp target teams distribute parallel for collapse(2)
+   135	    for (j = 1; j <= hid; ++j) {
+   136	      for (k = 0; k <= in; ++k) {
+   137	        float new_dw = ((ETA * hidden_delta[j] * input_units[k]) + (MOMENTUM * input_prev_weights[(k * input_cols) + j]));
+   138	        input_weights[(k * input_cols) + j] += new_dw;
+   139	        input_prev_weights[(k * input_cols) + j] = new_dw;
+   140	      }
+   141	    }
+   142	  }
+   143	
+   144	  *eo = out_err;
+   145	  *eh = hid_err;
+   146	
+   147	}
+
+---
+     1	
+     2	#include <stdio.h>
+     3	#include <stdlib.h>
+     4	#include "backprop.h"
+     5	
+     6	extern int layer_size;
+     7	
+     8	void load(BPNN *net)
+     9	{
+    10	  float *units;
+    11	  int nr, i, k;
+    12	
+    13	  nr = layer_size;
+    14	  units = net->input_units;
+    15	
+    16	  units[0] = 1.0f;
+    17	  k = 1;
+    18	  for (i = 0; i < nr; i++) {
+    19		  units[k] = (float) rand()/RAND_MAX ;
+    20		  k++;
+    21	    }
+    22	}
+
+---
+     1	# Makefile for backprop-serial (omp version)
+     2	
+     3	#===============================================================================
+     4	# User Options
+     5	#===============================================================================
+     6	
+     7	# Compiler can be set below, or via environment variable
+     8	CC        = nvc
+     9	OPTIMIZE  = yes
+    10	DEBUG     = no
+    11	DEVICE    = gpu
+    12	SM        = cc89
+    13	LAUNCHER  =
+    14	GATE_ROOT ?= $(abspath ../..)
+    15	REF_DIR   ?= $(GATE_ROOT)/golden_labels/src/backprop-serial
+    16	REF_BIN   ?= $(REF_DIR)/backprop
+    17	REF_MAKE  ?= Makefile.nvc
+    18	
+    19	RUN_ARGS ?= 65536
+    20	
+    21	#===============================================================================
+    22	# Program name & source code list
+    23	#===============================================================================
+    24	
+    25	program = backprop
+    26	
+    27	source = backprop.c facetrain.c imagenet.c backprop_kernel.c
+    28	
+    29	obj = $(source:.c=.o)
+    30	
+    31	#===============================================================================
+    32	# Sets Flags
+    33	#===============================================================================
+    34	
+    35	# Standard Flags
+    36	CFLAGS := $(EXTRA_CFLAGS) -Wall -I$(GATE_ROOT)/gate_sdk
+    37	LDFLAGS = -lm
+    38	
+    39	# Debug Flags
+    40	ifeq ($(DEBUG),yes)
+    41	  CFLAGS += -g -DDEBUG
+    42	  LDFLAGS  += -g
+    43	endif
+    44	
+    45	
+    46	# Optimization Flags
+    47	ifeq ($(OPTIMIZE),yes)
+    48	  CFLAGS += -O3
+    49	endif
+    50	
+    51	ifeq ($(DEVICE),gpu)
+    52	  CFLAGS += -Minfo=mp -mp=gpu -gpu=$(SM)
+    53	else
+    54	  CFLAGS +=-qopenmp
+    55	endif
+    56	#===============================================================================
+    57	# Targets to Build
+    58	#===============================================================================
+    59	
+    60	$(program): $(obj)
+    61		$(CC) $(CFLAGS) $(obj) -o $@ $(LDFLAGS)
+    62	
+    63	%.o: %.c
+    64		$(CC) $(CFLAGS) -c $< -o $@
+    65	
+    66	clean:
+    67		rm -rf $(program) $(obj)
+    68	
+    69	run: $(program)
+    70		$(LAUNCHER) ./$(program) $(RUN_ARGS)
+    71	
+    72	.PHONY: ref_build
+    73	ref_build:
+    74		$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) clean
+    75		$(MAKE) -C $(REF_DIR) -f $(REF_MAKE) CC="$(CC)" OPTIMIZE="$(OPTIMIZE)" DEBUG="$(DEBUG)" DEVICE="$(DEVICE)" SM="$(SM)" CFLAGS="$(CFLAGS) -I$(GATE_ROOT)/gate_sdk"
+    76	
+    77	.PHONY: check-correctness
+    78	check-correctness: $(program) ref_build
+    79		OMP_TARGET_OFFLOAD=MANDATORY python3 $(GATE_ROOT)/gate_sdk/scripts/gate_harness.py $(REF_BIN) ./$(program) $(RUN_ARGS)
+
+Implemented the OpenMP offload baseline in `data/src/backprop-omp` and verified it builds and runs with mandatory target offload.
+
+What changed:
+- Moved the core training compute into GPU target regions in [`backprop_kernel.c`](/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/backprop_kernel.c#L42).
+- Made the weight matrices contiguous so device mapping works cleanly in [`backprop.c`](/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/backprop.c#L69).
+- Marked `squash()` for device use in [`backprop.c`](/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/backprop.c#L42).
+- Fixed the loader so the input bias unit is initialized in [`imagenet.c`](/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/imagenet.c#L8).
+- Updated the build system for NVC, `.c` sources, GPU flags, and the required run argument in [`Makefile.nvc`](/root/codex_baseline/custom_serial_to_omp_workdir_20260412123745/data/src/backprop-omp/Makefile.nvc#L8).
+
+Validation:
+- `make -f Makefile.nvc clean`
+- `make -f Makefile.nvc`
+- `env OMP_TARGET_OFFLOAD=MANDATORY make -f Makefile.nvc run`
+
+Run output completed successfully:
+- `Input layer size : 65536`
+- `Starting training kernel`
+- `Performing GPU computation`
+- `Training done`
+
+The build still emits legacy K&R-style warnings from the original codebase, but the executable links and the offloaded run succeeds.
+tokens used
+1,460,436
